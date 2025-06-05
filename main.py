@@ -316,9 +316,9 @@ with col1:
 
     # Ensure default paths if files are not uploaded
     if not upload_file:
-        upload_file = r"C:\Users\User\Desktop\training\upload file - HTS.xlsx"
+        upload_file = "upload file - HTS.xlsx"
     if not final_sheet_file:
-        final_sheet_file = r"C:\Users\User\Desktop\training\FINAL SHEET.xlsx"
+        final_sheet_file = "FINAL SHEET.xlsx"
 
     if techno_commercial_file:
         custom_name_excel = st.text_input("Custom Name for 'Upload HTS'")
@@ -424,11 +424,11 @@ with col2:
 
     # Default paths for missing uploads
     if not created_excel_template:
-        created_excel_template = r"C:\Users\User\Desktop\training\raw_template.xlsx"
+        created_excel_template = "raw_template.xlsx"
     if not template_excel_path:
-        template_excel_path = r"C:\Users\User\Desktop\training\upload file - HTS.xlsx"
+        template_excel_path = "upload file - HTS.xlsx"
     if not pdf_final_sheet:
-        pdf_final_sheet = r"C:\Users\User\Desktop\training\FINAL SHEET.xlsx"
+        pdf_final_sheet = "FINAL SHEET.xlsx"
 
     if pdf_file:
         htsnum = st.text_input("HTS Number")
