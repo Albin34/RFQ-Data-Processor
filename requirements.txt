@@ -3,3 +3,4 @@ openai
 openpyxl
 st_copy_to_clipboard
 PyPDF2 
+pandas
