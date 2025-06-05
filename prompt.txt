@@ -1,0 +1,139 @@
+Your task is to convert raw text (typically related to PO material or product data) into a structured text format by removing blank data which is to be inserted in an excel cell. The output text should strictly contain only the formatted text. No other single letter or characters. The formatted output should include the following sections, in this exact order:
+
+1. PO Material Text (Optional):
+   - Include this section only if "PO Material Text" is provided in the raw text.
+   - This section must appear first if present.
+
+2. Basic Data Text:
+   - This section must always appear first if "PO Material Text" is not provided.
+   - Include all relevant product details without missing any content provided in the raw text.
+
+3. Classification Text:
+   - This section follows the "Basic Data Text."
+   - Include classification details and characteristics as given in the raw input.
+
+4. MPN Text:
+   - This section follows the "Classification Text."
+   - Include any manufacturer part numbers (MPNs), manufacturer names, and relevant details mentioned.
+
+5. Inspection Text (Optional):
+   - Include this section only if inspection details are provided.
+
+
+Example:
+"""
+Raw text:
+"Basic Data Text:
+CLASS:ACCESSORIES-TELCOM
+POWER RATING:150/250W
+APPLICATION:GMDSS RADIO DSC CLASS A
+Classification Text: Class :UNIT
+Characteristics :
+TYPE :ANTENNA TUNING MPN Text:
+Manufacturer Part Number
+:406381A
+Manufacturer number :0020016379 -SAILOR OEM Part Number :
+OEM Model Number :
+OEM Serial Number :
+Drawing Number :
+Position Number :
+Tag Number :
+Assembly Number : Inspection Text:
+CERTIFICATE OF
+CONFORMANCE	= 
+G/L Account = 
+Material PO Text :
+Basic Data Text:
+CLASS:ACCESSORIES-TELCOM
+POWER RATING:150/250W
+APPLICATION:GMDSS RADIO DSC CLASS A
+Classification Text: Class :UNIT
+Characteristics :
+TYPE :ANTENNA TUNING MPN Text:
+Manufacturer Part Number
+:406381A
+Manufacturer number :0020016379 -SAILOR OEM Part Number :
+OEM Model Number :
+OEM Serial Number :
+Drawing Number :
+Position Number :
+Tag Number :
+Assembly Number : Inspection Text:
+CERTIFICATE OF
+CONFORMANCE"
+"""
+Formatted text:
+
+"""
+Basic Data Text:
+CLASS:ACCESSORIES-TELCOM
+POWER RATING:150/250W
+APPLICATION:GMDSS RADIO DSC CLASS A
+
+Classification Text:
+Class: UNIT
+Characteristics:
+TYPE: ANTENNA TUNING
+
+MPN Text:
+Manufacturer Part Number: 406381A
+Manufacturer number: 0020016379 - SAILOR
+
+Inspection Text:
+CERTIFICATE OF CONFORMANCE
+""""
+Example 2:
+Raw text:
+"""
+"Basic Data Text:
+---
+
+Classification Text:
+Class :GREASE
+Characteristics :
+APPLICATION :---
+BASE OIL TYPE :---
+CONTAINER TYPE :1KG
+FORM OF SUPPLY :---
+SOAP TYPE :---
+TRADE NAME :MOLYKOTE 3451
+
+MPNText:
+
+Manufacturer Part Number :MOLYKOTE 3451
+Manufacturer number:0020001115 -MOLYKOTE (DOW CORNING)
+OEM Part Number :
+OEM Model Number :
+OEM Serial Number :
+Drawing Number :
+Position Number :
+Tag Number :
+Assembly Number :
+"""
+
+
+Formatted text:
+"""
+Basic Data Text:
+---
+
+Classification Text:
+Class: GREASE
+Characteristics:
+CONTAINER TYPE: 1KG
+TRADE NAME: MOLYKOTE 3451
+
+MPN Text:
+Manufacturer Part Number: MOLYKOTE 3451
+Manufacturer number: 0020001115 - MOLYKOTE (DOW CORNING)
+"""
+
+Additional Guidelines:
+- Omit Empty Fields: *Do not include fields or sections that are not explicitly mentioned in the raw input*. If data such as "Form of Supply," "Type," or similar is missing or blank, simply ignore those fields.
+- Do Not Include Unmentioned Sections: Only include sections (such as "Classification Text," "MPN Text," "Inspection Text") if they are explicitly mentioned in the raw data. If a section is not mentioned in the raw text, it should not appear in the formatted output.
+- Do Not Add Data: Your task is only to clean and structure the data provided. Do not add or infer any additional data that is not present in the raw text.
+- Always Provide Clear and Concise Output: Ensure the text is well-structured and easy to follow.
+
+Ensure the text is clear text format, well-structured, and adhering strictly to the data provided in the raw input.
+
+Below is the raw text: 
