@@ -32,7 +32,7 @@ except FileNotFoundError:
 
 def format_text(po_text: str) -> str:
     """
-    Send po_text to the Mistral agent, strip backticks, return cleaned string.
+    Sends po_text to the Mistral agent, strips backticks, and returns the cleaned string.
     """
     try:
         chat_response = client.agents.complete(
@@ -48,7 +48,7 @@ def format_text(po_text: str) -> str:
 
 def manufacture_name(po_text: str) -> str:
     """
-    Ask Mistral to extract manufacturer names (hyphen-separated) from PO text.
+    Calls Mistral to extract manufacturer names (hyphen-separated) from PO text.
     """
     try:
         chat_response = client.chat.complete(
@@ -58,8 +58,8 @@ def manufacture_name(po_text: str) -> str:
                     "role": "user",
                     "content": (
                         "Extract the manufacturer or maker names separated by hyphen '-' "
-                        f"mentioned in the PO text as a list in plain text. Output should strictly "
-                        f"contain the list of manufacturer names only.\ncontent: {po_text}"
+                        f"mentioned in the PO text as a list in plain text. Output should strictly contain "
+                        f"the list of manufacturer names only.\ncontent: {po_text}"
                     ),
                 }
             ],
@@ -111,7 +111,7 @@ def parse_text(text: str, rfq_text: str) -> list[dict]:
         re.DOTALL,
     )
     short_text_pattern = re.compile(r"Short Text :(.*?)\n", re.DOTALL)
-    po_text_pattern = re.compile(r"PO Material Text :(.*?)Agreement / LineNo.", re.DOTALL)
+    po_text_pattern = re.compile(r"PO Material Text :(.*?)Agreement / LineNo\.", re.DOTALL)
 
     items = item_pattern.findall(text)
     short_texts = short_text_pattern.findall(text)
@@ -120,6 +120,7 @@ def parse_text(text: str, rfq_text: str) -> list[dict]:
     data = []
     for i in range(len(items)):
         mat_candidate = items[i][1]
+        # only accept if it starts with 'B12', '12', 'B16', or '15'
         if mat_candidate.startswith(("B12", "12", "B16", "15")):
             material_no = mat_candidate
         else:
@@ -139,22 +140,23 @@ def parse_text(text: str, rfq_text: str) -> list[dict]:
     return data
 
 
-def insert_data_to_workbook(data: list[dict], template_path: str) -> Workbook:
+def insert_data_into_workbook(data: list[dict], template_path: str) -> Workbook:
     """
     Given a list of dicts (from parse_text) and a template file path,
-    return a new openpyxl.Workbook object whose cell A2:H… is populated.
-    This does not save to disk; it returns the in‐memory Workbook.
+    return an in‐memory openpyxl.Workbook object whose cell A2:H… is populated.
+    This leaves row 1’s header formatting (column widths, bold, borders, etc.) intact.
     """
-    # 1) Load the template:
+    # 1) Load the existing template:
     wb = load_workbook(template_path)
     ws = wb.active
 
-    # 2) Clear row 2 onward:
+    # 2) Clear any existing data from row 2 onward (we only clear the cell values,
+    #    but we do NOT touch row 1’s formatting or column widths):
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row:
             cell.value = None
 
-    # 3) Map columns:
+    # 3) Define column‐letter mapping:
     col_map = {
         "RFx Number": "A",
         "RFx Item No": "B",
@@ -166,12 +168,12 @@ def insert_data_to_workbook(data: list[dict], template_path: str) -> Workbook:
         "UOM": "H",
     }
 
-    # 4) Write each row of data into ws starting at row 2:
+    # 4) Write each row of data into ws, starting at row 2:
     for idx, rowdict in enumerate(data, start=2):
         for key, col_letter in col_map.items():
             ws[f"{col_letter}{idx}"] = rowdict[key]
 
-    # 5) Wrap text for all cells:
+    # 5) Re‐apply wrap‐text alignment for every cell (so that long multiline texts flow):
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
@@ -179,12 +181,16 @@ def insert_data_to_workbook(data: list[dict], template_path: str) -> Workbook:
     return wb
 
 
-def generate_upload_and_final_workbooks(pdf_file, raw_template_path, hts_number: str, hts_template_path) -> tuple[io.BytesIO, io.BytesIO]:
+def generate_upload_and_final_workbooks(
+    pdf_file, raw_template_path: str, hts_number: str, hts_template_path: str
+) -> tuple[io.BytesIO, io.BytesIO]:
     """
     - Step 1: extract & clean text from PDF → parse_text → data list
-    - Step 2: insert data into the “raw_template” to produce the “upload_file” workbook
-    - Step 3: insert data + formatted PO Text + manufacturer into the “hts_template” to produce “final_sheet” workbook
-    Returns: two BytesIO buffers: (upload_file_buffer, final_sheet_buffer)
+    - Step 2: insert_data_into_workbook(data, raw_template_path) → “upload” workbook
+    - Step 3: load hts_template_path (“upload file – HTS.xlsx”), clear row 2 onward, then
+              write column A:D from the data list and run format_text/ manufacture_name to
+              fill columns E and G → “final” workbook
+    Returns: two BytesIO buffers: (upload_buffer, final_buffer).
     """
     # 1) Extract texts:
     cleaned_text = extract_text_from_pdf(pdf_file)
@@ -192,12 +198,9 @@ def generate_upload_and_final_workbooks(pdf_file, raw_template_path, hts_number:
     data = parse_text(cleaned_text, rfq_text)
 
     # 2) Build “upload_file – HTS.xlsx” in memory:
-    #    Use raw_template_path (e.g. "data\\raw_template.xlsx") as the base.
-    upload_wb = insert_data_to_workbook(data, raw_template_path)
+    upload_wb = insert_data_into_workbook(data, raw_template_path)
 
     # 3) Now build “Final Sheet – HTS.xlsx”:
-    #    We start from hts_template_path (e.g. "data\\upload file - HTS.xlsx") and then fill columns A–D from “upload_wb”
-    #    plus format PO Text → column E and manufacturer → column G.
     final_wb = load_workbook(hts_template_path)
     final_ws = final_wb.active
 
@@ -206,32 +209,37 @@ def generate_upload_and_final_workbooks(pdf_file, raw_template_path, hts_number:
         for cell in row:
             cell.value = None
 
-    # 3b) Loop over each item in “data” (which matches upload_wb’s A:H columns), and write:
+    # 3b) Populate row 2 onward exactly like your template’s columns:
     paste_row = 2
     for rowdict in data:
+        # A = RFx Item No
         final_ws[f"A{paste_row}"] = rowdict["RFx Item No"]
-        final_ws[f"B{paste_row}"] = rowdict["Description"]
+        # B = Description
+        final_WS_desc = rowdict["Description"]
+        final_ws[f"B{paste_row}"] = final_WS_desc
+        # C = QTY
         final_ws[f"C{paste_row}"] = rowdict["QTY"]
+        # D = UOM
         final_ws[f"D{paste_row}"] = rowdict["UOM"]
 
-        # Column E = formatted PO Text via Mistral
+        # E = formatted PO Text (via format_text)
         formatted_po = format_text(rowdict["PO Text"])
         final_ws[f"E{paste_row}"] = formatted_po
         time.sleep(1)
 
-        # Column G = manufacturer_name via Mistral
-        mfr = manufacture_name(rowdict["PO Text"])
-        final_ws[f"G{paste_row}"] = mfr
+        # G = manufacturer name (via manufacture_name)
+        mfr_name = manufacture_name(rowdict["PO Text"])
+        final_ws[f"G{paste_row}"] = mfr_name
         time.sleep(1)
 
         paste_row += 1
 
-    # 3c) Wrap text for entire final_ws:
+    # 3c) Wrap text for all cells again:
     for row in final_ws.iter_rows(min_row=1, max_row=final_ws.max_row, min_col=1, max_col=final_ws.max_column):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
 
-    # 4) Save both workbooks to BytesIO buffers:
+    # 4) Save both workbooks into BytesIO buffers:
     upload_buffer = io.BytesIO()
     upload_wb.save(upload_buffer)
     upload_buffer.seek(0)
@@ -249,18 +257,15 @@ def process_final_sheet_for_manufacturer(input_excel_path: str) -> str:
     """
     df = pd.read_excel(input_excel_path)
     output_dict = defaultdict(lambda: {"items": [], "emails": []})
+
     for _, row in df.iterrows():
         manufacturers = row.get("Manufacturer", "")
         if pd.notna(manufacturers):
             mfr_list = [m.strip() for m in manufacturers.split("-")]
             item_number = row.get("Line item number", "")
-            emails = [
-                row[col]
-                for col in df.columns
-                if "mail" in col.lower() or "unnamed" in col.lower()
-            ]
-            emails = [e for e in emails if pd.notna(e)]
-            email_str = "\n".join(emails) if emails else None
+            emails = [row[col] for col in df.columns if "mail" in col.lower() or "unnamed" in col.lower()]
+            filtered_emails = [e for e in emails if pd.notna(e)]
+            email_str = "\n".join(filtered_emails) if emails else None
 
             for mfr in mfr_list:
                 output_dict[mfr]["items"].append(item_number)
@@ -279,9 +284,7 @@ def process_final_sheet_for_manufacturer(input_excel_path: str) -> str:
 # ───────────────
 # (3) Build the Streamlit UI
 # ───────────────
-st.set_page_config(
-    page_title="Data Processor", layout="wide", initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title="Data Processor", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -316,12 +319,12 @@ st.markdown(
 
 col1, col2, col3 = st.columns([2, 2, 1])
 
-# ---- Column 1: Excel Data Processor (unchanged) ----
+#
+# ---- Column 1: Excel Data Processor (unchanged, but we’ll also write in‐memory for download) ----
+#
 with col1:
     st.subheader("🗃️ Excel Data Processor")
-    techno_commercial_file = st.file_uploader(
-        "Upload Techno Commercial Envelope File (.xls)", type=["xls"]
-    )
+    techno_commercial_file = st.file_uploader("Upload Techno Commercial Envelope File (.xls)", type=["xls"])
     with st.expander("Upload Excel Files", expanded=True):
         upload_file = st.file_uploader("Upload File (.xlsx)", type=["xlsx"])
         final_sheet_file = st.file_uploader("Final Sheet File (.xlsx)", type=["xlsx"])
@@ -333,30 +336,29 @@ with col1:
 
     if techno_commercial_file:
         custom_name_excel = st.text_input("Custom Name for 'Upload HTS'")
-        # We no longer ask for “Save Path” here; we will offer a download.
         if st.button("🚀 Process Excel Files"):
             if custom_name_excel:
                 try:
-                    # Exactly the same logic as before, except we save into memory and then download.
+                    # Exactly the same logic as before, except save everything into BytesIO
                     rfx_number = re.search(r"\d+", techno_commercial_file.name).group()
                     xls = pd.ExcelFile(techno_commercial_file)
                     required_columns = ["Description", "InternalNote", "Quantity", "Unit of Measure"]
-                    correct_sheet_name = None
+                    correct_sheet = None
                     for sheet_name in xls.sheet_names:
-                        df_ = pd.read_excel(xls, sheet_name=sheet_name)
-                        if all(column in df_.columns for column in required_columns):
-                            correct_sheet_name = sheet_name
+                        tmp = pd.read_excel(xls, sheet_name=sheet_name)
+                        if all(col in tmp.columns for col in required_columns):
+                            correct_sheet = sheet_name
                             break
-                    if correct_sheet_name is None:
+                    if correct_sheet is None:
                         st.error("Could not find a sheet with the required columns.")
                         raise ValueError("Missing required columns")
-                    techno_df = pd.read_excel(techno_commercial_file, sheet_name=correct_sheet_name)
+                    techno_df = pd.read_excel(techno_commercial_file, sheet_name=correct_sheet)
 
-                    # Load the “upload_file” template from disk:
+                    # Build the “upload_file” in memory:
                     wb_upload = load_workbook(upload_file)
                     ws_upload = wb_upload.active
                     # Clear row 2 onward
-                    for row in ws_upload.iter_rows(min_row=2, max_row=ws_upload.max_row):
+                    for row in ws_upload.iter_rows(min_row=2, max_row=ws_upload.max_row, min_col=1, max_col=ws_upload.max_column):
                         for cell in row:
                             cell.value = None
 
@@ -374,15 +376,16 @@ with col1:
                             paste_row += 1
                             rfx_item_no += 10
 
-                    # Wrap text for the upload workbook:
-                    for row in ws_upload.iter_rows():
+                    # Wrap text on every cell in upload_file:
+                    for row in ws_upload.iter_rows(min_row=1, max_row=ws_upload.max_row, min_col=1, max_col=ws_upload.max_column):
                         for cell in row:
                             cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
 
-                    # Now create the “final worksheet” from the final_sheet_file template:
+                    # Build the “final_sheet” in memory:
                     wb_final = load_workbook(final_sheet_file)
                     ws_final = wb_final.active
-                    for row in ws_final.iter_rows(min_row=2, max_row=ws_final.max_row):
+                    # Clear row 2 onward
+                    for row in ws_final.iter_rows(min_row=2, max_row=ws_final.max_row, min_col=1, max_col=ws_final.max_column):
                         for cell in row:
                             cell.value = None
 
@@ -394,21 +397,22 @@ with col1:
                             ws_final[f"B{paste_row1}"] = techno_df["Description"].iloc[i]
                             ws_final[f"C{paste_row1}"] = techno_df["Quantity"].iloc[i]
                             ws_final[f"D{paste_row1}"] = techno_df["Unit of Measure"].iloc[i]
-                            po_text_ = techno_df["InternalNote"].iloc[i]
-                            formatted_po = format_text(po_text_)
+                            po_txt = techno_df["InternalNote"].iloc[i]
+                            formatted_po = format_text(po_txt)
                             ws_final[f"E{paste_row1}"] = formatted_po
                             time.sleep(1)
-                            mfr_ = manufacture_name(po_text_)
-                            ws_final[f"G{paste_row1}"] = mfr_
+                            mfr_n = manufacture_name(po_txt)
+                            ws_final[f"G{paste_row1}"] = mfr_n
                             time.sleep(1)
                             paste_row1 += 1
                             rfx_item_no1 += 10
 
-                    for row in ws_final.iter_rows():
+                    # Wrap text on every cell in final_sheet:
+                    for row in ws_final.iter_rows(min_row=1, max_row=ws_final.max_row, min_col=1, max_col=ws_final.max_column):
                         for cell in row:
                             cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
 
-                    # Now save both workbooks in memory:
+                    # Save both workbooks to BytesIO
                     buf_upload = io.BytesIO()
                     wb_upload.save(buf_upload)
                     buf_upload.seek(0)
@@ -417,7 +421,7 @@ with col1:
                     wb_final.save(buf_final)
                     buf_final.seek(0)
 
-                    # Offer download buttons in Streamlit:
+                    # Offer download buttons
                     download_name1 = f"upload file - {custom_name_excel}.xlsx"
                     st.download_button(
                         label="⬇️ Download Upload‐File",
@@ -440,7 +444,9 @@ with col1:
                 st.warning("Please provide a custom name.")
 
 
-# ---- Column 2: PDF Data Processor (replaced Save Path with download) ----
+#
+# ---- Column 2: PDF Data Processor (no local “Save Path”—we just download) ----
+#
 with col2:
     st.subheader("📑 PDF Data Processor")
     pdf_file = st.file_uploader("Upload PDF File", type=["pdf"])
@@ -450,11 +456,11 @@ with col2:
         pdf_final_sheet = st.file_uploader("Final Sheet Template (.xlsx)", type=["xlsx"])
 
     if not created_excel_template:
-        created_excel_template = os.path.join(os.getcwd(), "raw_template.xlsx")
+        created_excel_template = os.path.join(os.getcwd(), "data", "raw_template.xlsx")
     if not template_excel_path:
-        template_excel_path = os.path.join(os.getcwd(), "upload file - HTS.xlsx")
+        template_excel_path = os.path.join(os.getcwd(), "data", "upload file - HTS.xlsx")
     if not pdf_final_sheet:
-        pdf_final_sheet = os.path.join(os.getcwd(), "FINAL SHEET.xlsx")
+        pdf_final_sheet = os.path.join(os.getcwd(), "data", "FINAL SHEET.xlsx")
 
     htsnum = st.text_input("HTS Number")
     if pdf_file and htsnum:
@@ -462,13 +468,13 @@ with col2:
             try:
                 # Generate two in‐memory Excel files:
                 buf_upload_pdf, buf_final_pdf = generate_upload_and_final_workbooks(
-                    pdf_file, 
-                    created_excel_template, 
-                    htsnum, 
-                    template_excel_path
+                    pdf_file,
+                    created_excel_template,
+                    htsnum,
+                    template_excel_path,
                 )
 
-                # Offer Download buttons (names include HTSNum):
+                # Offer Download buttons (names include HTS Number)
                 download_name_pdf1 = f"upload file - {htsnum}.xlsx"
                 st.download_button(
                     label="⬇️ Download Upload‐File (from PDF)",
@@ -495,7 +501,9 @@ with col2:
             st.info("Please enter an HTS Number.")
 
 
-# ---- Column 3: List Maker (unchanged) ----
+#
+# ---- Column 3: List Maker ----
+#
 with col3:
     st.subheader("📝 List Maker")
     final_sheet_for_manufacturer = st.file_uploader("Final Sheet File for Manufacturer", type=["xlsx"])
@@ -511,7 +519,7 @@ with col3:
 
     if st.button("🚀 Process Default File"):
         try:
-            default_path = os.path.join(os.getcwd(), "FINAL SHEET.xlsx")
+            default_path = os.path.join(os.getcwd(), "data", "FINAL SHEET.xlsx")
             final_output = process_final_sheet_for_manufacturer(default_path)
             st.text_area("Formatted Output", final_output, height=300)
             st_copy_to_clipboard(final_output)
