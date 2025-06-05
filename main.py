@@ -9,7 +9,7 @@ from collections import defaultdict
 import os
 import openai
 import time
-#genai.configure(api_key= "-AIzaSyBB5Jtkc4uzeewUt-1wP7LEEedunASIiCQ")
+#genai.configure(api_key= "-AIzaSyBB5Jtkc4uzeewUt-1wP7LEEedunA SIiCQ")
 #model = genai.GenerativeModel('gemini-1.5-flash')
 from mistralai import Mistral
 
