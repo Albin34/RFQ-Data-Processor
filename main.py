@@ -1,5 +1,7 @@
 import streamlit as st
 from st_copy_to_clipboard import st_copy_to_clipboard
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from streamlit.runtime import Runtime
 import pandas as pd
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
@@ -17,6 +19,16 @@ model = "mistral-large-latest"
 
 client = Mistral(api_key=api_key)
 
+def download_file(data, file_name):
+    ctx = get_script_run_ctx()
+    if ctx:
+        session_id = ctx.session_id
+        Runtime.instance().media_file_mgr.add(
+            data,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_name=file_name,
+            session_id=session_id
+        )
 # Read the system prompt from a text file
 try:
     with open("prompt.txt", "r") as file:
@@ -376,6 +388,11 @@ with col1:
                     final_output.seek(0)
                     
                     # Offer files for download
+                    # Replace the download buttons code with:
+                    if upload_output and final_output:
+                        download_file(upload_output, f"upload file - {custom_name_excel}.xlsx")
+                        download_file(final_output, f"FINAL SHEET - {custom_name_excel}.xlsx")
+                    st.success("Files processed and downloaded automatically!")
                     st.download_button(
                         label="📥 Download Upload File",
                         data=upload_output,
@@ -418,6 +435,11 @@ with col2:
                     final_sheet_content = process_final_sheet_from_pdf(pdf_file, upload_file_content)
                     
                     # Offer files for download
+                    # Replace the download buttons code with:
+                    if upload_file_content and final_sheet_content:
+                        download_file(upload_file_content, f"upload file - {htsnum}.xlsx")
+                        download_file(final_sheet_content, f"FINAL SHEET - {htsnum}.xlsx")
+                    st.success("Files processed and downloaded automatically!")
                     st.download_button(
                         label="📥 Download Upload File",
                         data=upload_file_content,
