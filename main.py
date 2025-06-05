@@ -330,9 +330,9 @@ with col1:
         final_sheet_file = st.file_uploader("Final Sheet File (.xlsx)", type=["xlsx"])
 
     if not upload_file:
-        upload_file = os.path.join(os.getcwd(), "upload file - HTS.xlsx")
+        upload_file = "upload file - HTS.xlsx"
     if not final_sheet_file:
-        final_sheet_file = os.path.join(os.getcwd(), "FINAL SHEET.xlsx")
+        final_sheet_file =  "FINAL SHEET.xlsx"
 
     if techno_commercial_file:
         custom_name_excel = st.text_input("Custom Name for 'Upload HTS'")
@@ -456,11 +456,11 @@ with col2:
         pdf_final_sheet = st.file_uploader("Final Sheet Template (.xlsx)", type=["xlsx"])
 
     if not created_excel_template:
-        created_excel_template = os.path.join(os.getcwd(), "data", "raw_template.xlsx")
+        created_excel_template = "raw_template.xlsx"
     if not template_excel_path:
-        template_excel_path = os.path.join(os.getcwd(), "data", "upload file - HTS.xlsx")
+        template_excel_path = "upload file - HTS.xlsx"
     if not pdf_final_sheet:
-        pdf_final_sheet = os.path.join(os.getcwd(), "data", "FINAL SHEET.xlsx")
+        pdf_final_sheet = "FINAL SHEET.xlsx"
 
     htsnum = st.text_input("HTS Number")
     if pdf_file and htsnum:
@@ -519,7 +519,7 @@ with col3:
 
     if st.button("🚀 Process Default File"):
         try:
-            default_path = os.path.join(os.getcwd(), "data", "FINAL SHEET.xlsx")
+            default_path = "FINAL SHEET.xlsx"
             final_output = process_final_sheet_for_manufacturer(default_path)
             st.text_area("Formatted Output", final_output, height=300)
             st_copy_to_clipboard(final_output)
