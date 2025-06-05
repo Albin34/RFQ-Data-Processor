@@ -177,7 +177,7 @@ def process_pdf_to_final_excel(pdf_file):
     raw_template = insert_data_to_new_excel(data)
     
     # Process with HTS template
-    hts_template_path = r"C:\Users\User\Desktop\training\upload file - HTS.xlsx"
+    hts_template_path = "upload file - HTS.xlsx"
     with open(hts_template_path, "rb") as f:
         hts_template_content = io.BytesIO(f.read())
     
@@ -188,7 +188,7 @@ def process_final_sheet_from_pdf(pdf_file, upload_file_content):
     created_df = pd.read_excel(upload_file_content)
     
     # Create a new workbook for final sheet
-    wb = load_workbook(r"C:\Users\User\Desktop\training\FINAL SHEET.xlsx")
+    wb = load_workbook("FINAL SHEET.xlsx")
     final_sheet = wb.active
     
     # Clear existing data
@@ -312,7 +312,7 @@ with col1:
                     techno_df = pd.read_excel(techno_commercial_file, sheet_name=correct_sheet_name)
                     
                     # Create upload file
-                    upload_wb = load_workbook(r"C:\Users\User\Desktop\training\upload file - HTS.xlsx")
+                    upload_wb = load_workbook("upload file - HTS.xlsx")
                     upload_sheet = upload_wb.active
                     
                     for row in upload_sheet.iter_rows(min_row=2, max_row=upload_sheet.max_row):
@@ -342,7 +342,7 @@ with col1:
                     upload_output.seek(0)
                     
                     # Create final sheet
-                    final_wb = load_workbook(r"C:\Users\User\Desktop\training\FINAL SHEET.xlsx")
+                    final_wb = load_workbook("FINAL SHEET.xlsx")
                     final_sheet = final_wb.active
                     
                     for row in final_sheet.iter_rows(min_row=2, max_row=final_sheet.max_row):
@@ -454,7 +454,7 @@ with col3:
 
     if st.button("🚀 Process Default File"):
         try:
-            with open(r"C:\Users\User\Desktop\training\FINAL SHEET.xlsx", "rb") as f:
+            with open("FINAL SHEET.xlsx", "rb") as f:
                 final_output = process_final_sheet_for_manufacturer(io.BytesIO(f.read()))
             st.text_area("Formatted Output", final_output, height=300)
             st_copy_to_clipboard(final_output)
