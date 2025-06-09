@@ -319,13 +319,3 @@ with col3:
 # --------------------------------------------------
 # 4️⃣  LIST MAKER (Manufacturer summary)
 # --------------------------------------------------
-with col4:
-    st.subheader("📝 List Maker")
-    final_man = st.file_uploader("Final Sheet for Manufacturer", type=["xlsx"], key="list_man")
-    if final_man and st.button("🚀 Generate List", key="btn_list"):
-        try:
-            out = process_final_sheet_for_manufacturer(final_man)
-            st.text_area("Formatted Output", out, height=300)
-            st_copy_to_clipboard(out)
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
