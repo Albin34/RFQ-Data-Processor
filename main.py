@@ -15,7 +15,7 @@ from mistralai import Mistral
 # 🔑  API & MODEL INITIALISATION
 # ----------------------------
 #  ➜  Replace with your own key / agent if needed
-api_key = "RpBwVWJePMZCSS6cEDWROC4PTCNDl5sz"
+api_key = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
 model   = "mistral-large-latest"
 client  = Mistral(api_key=api_key)
 
