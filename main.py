@@ -27,7 +27,7 @@ def format_text(po_text: str) -> str:
     """Use Mistral agent to prettify / wrap the PO text snippet."""
     try:
         chat_response = client.agents.complete(
-            agent_id="ag:c04901dd:20241009:untitled-agent:4d5d10d7",
+            agent_id="ag:9d0568a2:20250612:cleaner:12c5f2da",
             messages=[{"role": "user", "content": po_text}],
         )
         cleaned = re.sub(r"[`]+", "", chat_response.choices[0].message.content)
