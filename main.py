@@ -1,58 +1,94 @@
+# streamlit_app.py
+import os
+import math
+import time
+import functools
+import tempfile
+from io import BytesIO
+from collections import defaultdict
+
 import streamlit as st
-from st_copy_to_clipboard import st_copy_to_clipboard
 import pandas as pd
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
-import re
-from collections import defaultdict
-from io import BytesIO
-import tempfile
-import time
 from mistralai import Mistral
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ----------------------------
 # 🔑  API & MODEL INITIALISATION
 # ----------------------------
-#  ➜  Replace with your own key / agent if needed
-api_key = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
-model   = "mistral-large-latest"
-client  = Mistral(api_key=api_key)
+API_KEY = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
+MODEL   = "mistral-large-latest"
+client  = Mistral(api_key=API_KEY)
 
 # ----------------------------
 # 🛠️  HELPER FUNCTIONS
 # ----------------------------
 
+def as_clean_str(x: object) -> str:
+    """Return a safe string ('' if None/NaN)."""
+    if x is None:
+        return ""
+    if isinstance(x, float) and math.isnan(x):
+        return ""
+    return str(x)
+
+# A very small in-memory cache for duplicate PO texts
+@functools.lru_cache(maxsize=1024)
+def _cached_format_text(po_text: str) -> str:
+    return _format_text_uncached(po_text)
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    retry=retry_if_exception_type(Exception),
+)
+def _format_text_uncached(po_text: str) -> str:
+    """Call the Mistral agent once (with retries)."""
+    chat_resp = client.agents.complete(
+        agent_id="ag:9d0568a2:20250612:cleaner:12c5f2da",
+        messages=[{"role": "user", "content": po_text}],
+    )
+    import re
+    return re.sub(r"[`]+", "", chat_resp.choices[0].message.content)
+
 def format_text(po_text: str) -> str:
-    """Use Mistral agent to prettify / wrap the PO text snippet."""
     try:
-        chat_response = client.agents.complete(
-            agent_id="ag:9d0568a2:20250612:cleaner:12c5f2da",
-            messages=[{"role": "user", "content": po_text}],
-        )
-        cleaned = re.sub(r"[`]+", "", chat_response.choices[0].message.content)
-        return cleaned
+        return _cached_format_text(as_clean_str(po_text))
     except Exception as e:
         st.error(f"Error formatting text → {e}")
-        return po_text
+        return as_clean_str(po_text)
+
+@functools.lru_cache(maxsize=1024)
+def _cached_manu(po_text: str) -> str:
+    return _manu_uncached(po_text)
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    retry=retry_if_exception_type(Exception),
+)
+def _manu_uncached(po_text: str) -> str:
+    resp = client.chat.complete(
+        model=MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Extract the manufacturer or maker names separated by hyphen - "
+                    "mentioned in the PO text as a list in plain text. Output must "
+                    "contain the list of manufacturer names only.\ncontent: "
+                    + po_text
+                ),
+            }
+        ],
+    )
+    return resp.choices[0].message.content
 
 def manufacture_name(po_text: str) -> str:
-    """Extract manufacturer names (hyphen‑separated) via Mistral chat."""
     try:
-        resp = client.chat.complete(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Extract the manufacturer or maker names separated by hyphen - "
-                        "mentioned in the PO text as a list in plain text. Output must "
-                        "contain the list of manufacturer names only.\ncontent: " + po_text
-                    ),
-                }
-            ],
-        )
-        return resp.choices[0].message.content
+        return _cached_manu(as_clean_str(po_text))
     except Exception as e:
         st.error(f"Error extracting manufacturer name → {e}")
         return ""
@@ -61,6 +97,7 @@ def manufacture_name(po_text: str) -> str:
 
 def extract_text_from_pdf(pdf_bytes):
     reader = PdfReader(pdf_bytes)
+    import re
     full = "".join(page.extract_text() for page in reader.pages)
     return re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)", "", full)
 
@@ -69,6 +106,7 @@ def extract_rfq_from_pdf(pdf_bytes):
     return "".join(page.extract_text() for page in reader.pages)
 
 def parse_text(text: str, rfq_text: str):
+    import re
     rfx_match = re.search(r"RFQ Number (\d+)", rfq_text)
     rfx_no    = rfx_match.group(1) if rfx_match else "Unknown"
 
@@ -105,7 +143,6 @@ def workbook_to_bytes(wb):
     buf.seek(0)
     return buf.getvalue()
 
-# In‑memory build of "upload file - HTS" columns order
 cols_order = [
     "RFx Number", "RFx Item No", "PR Item No", "Material No",
     "Description", "PO Text", "QTY", "UOM",
@@ -139,8 +176,6 @@ def merge_into_template(template_path: str, upload_wb):
             c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
     return wb
 
-# ---------- HTS‑Cleaner helper ----------
-
 def hts_to_final_sheet(upload_wb, final_template_path: str) -> bytes:
     final_wb = load_workbook(final_template_path)
     up_ws    = upload_wb.active
@@ -170,7 +205,6 @@ def hts_to_final_sheet(upload_wb, final_template_path: str) -> bytes:
 # ----------------------------
 # 🎈  STREAMLIT PAGE CONFIG
 # ----------------------------
-
 st.set_page_config(page_title="Data Processor", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
@@ -189,7 +223,7 @@ st.markdown(
 col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1.5])
 
 # ------------------------------------------------------
-# 1️⃣  EXCEL DATA PROCESSOR  (Techno‑Commercial xls → …)
+# 1️⃣  EXCEL DATA PROCESSOR
 # ------------------------------------------------------
 with col1:
     st.subheader("🗃️ Excel Data Processor")
@@ -204,13 +238,25 @@ with col1:
         custom_name = st.text_input("Custom name for results", key="cust_name_excel")
         if st.button("🚀 Process Excel", key="btn_excel") and custom_name:
             try:
+                import re
                 rfx_no   = re.search(r"\d+", techno_file.name).group()
+                # keep_default_na=False to avoid NaNs
                 xls      = pd.ExcelFile(techno_file)
-                sheet_ok = next((s for s in xls.sheet_names if all(c in pd.read_excel(xls, sheet_name=s).columns for c in ["Description","InternalNote","Quantity","Unit of Measure"])), None)
+                sheet_ok = next(
+                    (
+                        s
+                        for s in xls.sheet_names
+                        if all(
+                            c in pd.read_excel(xls, sheet_name=s).columns
+                            for c in ["Description", "InternalNote", "Quantity", "Unit of Measure"]
+                        )
+                    ),
+                    None,
+                )
                 if not sheet_ok:
                     st.error("Template columns missing in uploaded XLS")
                     st.stop()
-                df = pd.read_excel(techno_file, sheet_name=sheet_ok)
+                df = pd.read_excel(techno_file, sheet_name=sheet_ok, keep_default_na=False)
 
                 # Build Upload workbook
                 wb_upl = load_workbook(upload_tpl)
@@ -218,8 +264,8 @@ with col1:
                 for r in ws_upl.iter_rows(min_row=2, max_row=ws_upl.max_row):
                     for c in r: c.value = None
                 row = 2; item = 10
-                for i, rec in df.iterrows():
-                    if pd.notna(rec["Description"]):
+                for _, rec in df.iterrows():
+                    if rec["Description"]:
                         ws_upl[f"A{row}"] = rfx_no
                         ws_upl[f"B{row}"] = item
                         ws_upl[f"E{row}"] = rec["Description"]
@@ -229,7 +275,12 @@ with col1:
                         item += 10; row += 1
                 for r in ws_upl.iter_rows():
                     for c in r: c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-                st.download_button("📥 Download Upload File", workbook_to_bytes(wb_upl), file_name=f"upload file - {custom_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "📥 Download Upload File",
+                    workbook_to_bytes(wb_upl),
+                    file_name=f"upload file - {custom_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
                 # Build FINAL SHEET
                 wb_fin = load_workbook(final_tpl)
@@ -238,25 +289,30 @@ with col1:
                     for c in r: c.value = None
 
                 row = 2; item = 10
-                for i, rec in df.iterrows():
-                    if pd.notna(rec["Description"]):
+                for _, rec in df.iterrows():
+                    if rec["Description"]:
                         ws_fin[f"A{row}"] = item
                         ws_fin[f"B{row}"] = rec["Description"]
                         ws_fin[f"C{row}"] = rec["Quantity"]
                         ws_fin[f"D{row}"] = rec["Unit of Measure"]
-                        po = rec["InternalNote"] or ""
+                        po = rec["InternalNote"]
                         ws_fin[f"E{row}"] = format_text(po)
                         ws_fin[f"G{row}"] = manufacture_name(po)
                         item += 10; row += 1
                 for r in ws_fin.iter_rows():
                     for c in r: c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-                st.download_button("📥 Download FINAL SHEET", workbook_to_bytes(wb_fin), file_name=f"FINAL SHEET - {custom_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "📥 Download FINAL SHEET",
+                    workbook_to_bytes(wb_fin),
+                    file_name=f"FINAL SHEET - {custom_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 st.success("Excel processed ✔️")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
 # --------------------------------------------------
-# 2️⃣  PDF DATA PROCESSOR  (RFQ PDF → Upload + Final)
+# 2️⃣  PDF DATA PROCESSOR
 # --------------------------------------------------
 with col2:
     st.subheader("📑 PDF Data Processor")
@@ -290,14 +346,24 @@ with col2:
                 upl_bytes = open(t_upl_path, "rb").read()
                 fin_bytes = open(t_fin_path, "rb").read()
 
-                st.download_button("📥 Download Upload File", upl_bytes, file_name=f"upload file - {hts_no}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                st.download_button("📥 Download FINAL SHEET", fin_bytes, file_name=f"FINAL SHEET - {hts_no}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "📥 Download Upload File",
+                    upl_bytes,
+                    file_name=f"upload file - {hts_no}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.download_button(
+                    "📥 Download FINAL SHEET",
+                    fin_bytes,
+                    file_name=f"FINAL SHEET - {hts_no}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 st.success("PDF processed ✔️")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
 # --------------------------------------------------
-# 3️⃣  HTS CLEANER  (existing  Upload‑HTS → Final Sheet)
+# 3️⃣  HTS CLEANER
 # --------------------------------------------------
 with col3:
     st.subheader("🧹 HTS Cleaner")
@@ -311,7 +377,12 @@ with col3:
             try:
                 wb_up  = load_workbook(hts_upload)
                 final_bytes = hts_to_final_sheet(wb_up, fin_tpl_opt)
-                st.download_button("📥 Download FINAL SHEET", final_bytes, file_name=f"FINAL SHEET - {clean_name}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "📥 Download FINAL SHEET",
+                    final_bytes,
+                    file_name=f"FINAL SHEET - {clean_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 st.success("HTS cleaned ✔️")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
@@ -319,3 +390,4 @@ with col3:
 # --------------------------------------------------
 # 4️⃣  LIST MAKER (Manufacturer summary)
 # --------------------------------------------------
+# (You can continue your additional features here)
