@@ -297,7 +297,7 @@ with col2:
                 st.error(f"❌ Error: {e}")
 
 # --------------------------------------------------
-# 3️⃣  HTS CLEANER  (existing Upload‑HTS → Final Sheet)
+# 3️⃣  HTS CLEANER  (existing  Upload‑HTS → Final Sheet)
 # --------------------------------------------------
 with col3:
     st.subheader("🧹 HTS Cleaner")
