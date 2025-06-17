@@ -14,7 +14,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 # ══════════════════════════════════════
 # 🔑  API & model
 # ══════════════════════════════════════
-API_KEY = st.secrets.get("MISTRAL_API_KEY") or os.getenv("MISTRAL_API_KEY")
+API_KEY = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
 MODEL   = "mistral-large-latest"
 client  = Mistral(api_key=API_KEY)
 
