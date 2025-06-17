@@ -1,9 +1,5 @@
 # streamlit_app.py
-import os
-import math
-import time
-import functools
-import tempfile
+import os, math, re, time, tempfile, functools
 from io import BytesIO
 from collections import defaultdict
 
@@ -13,381 +9,307 @@ from PyPDF2 import PdfReader
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 from mistralai import Mistral
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-# ----------------------------
-# 🔑  API & MODEL INITIALISATION
-# ----------------------------
-API_KEY = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
+# ────────────────────────────────────────────────────────────────────────────────
+# 🔑  API & model
+# ────────────────────────────────────────────────────────────────────────────────
+API_KEY = st.secrets.get("MISTRAL_API_KEY") or os.getenv("MISTRAL_API_KEY")
 MODEL   = "mistral-large-latest"
 client  = Mistral(api_key=API_KEY)
 
-# ----------------------------
-# 🛠️  HELPER FUNCTIONS
-# ----------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# 🔧  helpers
+# ────────────────────────────────────────────────────────────────────────────────
+def _clean(x):
+    if x is None:                     return ""
+    if isinstance(x, float) and math.isnan(x):  return ""
+    return str(x).strip()
 
-def as_clean_str(x: object) -> str:
-    """Return a safe string ('' if None/NaN)."""
-    if x is None:
-        return ""
-    if isinstance(x, float) and math.isnan(x):
-        return ""
-    return str(x)
-
-# A very small in-memory cache for duplicate PO texts
 @functools.lru_cache(maxsize=1024)
-def _cached_format_text(po_text: str) -> str:
-    return _format_text_uncached(po_text)
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    retry=retry_if_exception_type(Exception),
-)
-def _format_text_uncached(po_text: str) -> str:
-    """Call the Mistral agent once (with retries)."""
-    chat_resp = client.agents.complete(
+@retry(wait=wait_exponential(multiplier=1, min=2, max=20),
+       stop=stop_after_attempt(5),
+       retry=retry_if_exception_type(Exception))
+def _fmt_uncached(txt):
+    res = client.agents.complete(
         agent_id="ag:9d0568a2:20250612:cleaner:12c5f2da",
-        messages=[{"role": "user", "content": po_text}],
+        messages=[{"role":"user","content":txt}]
     )
-    import re
-    return re.sub(r"[`]+", "", chat_resp.choices[0].message.content)
+    return re.sub(r"[`]+","",res.choices[0].message.content)
 
-def format_text(po_text: str) -> str:
-    try:
-        return _cached_format_text(as_clean_str(po_text))
+def format_text(txt):
+    try:    return _fmt_uncached(_clean(txt))
     except Exception as e:
-        st.error(f"Error formatting text → {e}")
-        return as_clean_str(po_text)
+        st.error(f"Format-text error → {e}"); return _clean(txt)
 
 @functools.lru_cache(maxsize=1024)
-def _cached_manu(po_text: str) -> str:
-    return _manu_uncached(po_text)
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    retry=retry_if_exception_type(Exception),
-)
-def _manu_uncached(po_text: str) -> str:
-    resp = client.chat.complete(
+@retry(wait=wait_exponential(multiplier=1, min=2, max=20),
+       stop=stop_after_attempt(5),
+       retry=retry_if_exception_type(Exception))
+def _manu_uncached(txt):
+    res = client.chat.complete(
         model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Extract the manufacturer or maker names separated by hyphen - "
-                    "mentioned in the PO text as a list in plain text. Output must "
-                    "contain the list of manufacturer names only.\ncontent: "
-                    + po_text
-                ),
-            }
-        ],
+        messages=[{"role":"user",
+                   "content":("Extract manufacturer / maker names separated by "
+                              "hyphen, plain list only\ncontent: "+txt)}]
     )
-    return resp.choices[0].message.content
+    return res.choices[0].message.content
 
-def manufacture_name(po_text: str) -> str:
-    try:
-        return _cached_manu(as_clean_str(po_text))
+def manufacture_name(txt):
+    try:    return _manu_uncached(_clean(txt))
     except Exception as e:
-        st.error(f"Error extracting manufacturer name → {e}")
-        return ""
+        st.error(f"Manufacturer-name error → {e}"); return ""
 
-# ---------- PDF utilities ----------
+def workbook_bytes(wb):
+    buf=BytesIO(); wb.save(buf); buf.seek(0); return buf.getvalue()
 
-def extract_text_from_pdf(pdf_bytes):
-    reader = PdfReader(pdf_bytes)
-    import re
-    full = "".join(page.extract_text() for page in reader.pages)
-    return re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)", "", full)
-
-def extract_rfq_from_pdf(pdf_bytes):
-    reader = PdfReader(pdf_bytes)
-    return "".join(page.extract_text() for page in reader.pages)
-
-def parse_text(text: str, rfq_text: str):
-    import re
-    rfx_match = re.search(r"RFQ Number (\d+)", rfq_text)
-    rfx_no    = rfx_match.group(1) if rfx_match else "Unknown"
-
-    item_pat  = re.compile(r"(\d{5}) (\w?12\d{10}) (\d+(?:\.\d+)?)(\s*)(\w+) .*?(\d{2}\.\d{2}\.\d{4})", re.DOTALL)
-    short_pat = re.compile(r"Short Text :(.*?)\n", re.DOTALL)
-    po_pat    = re.compile(r"PO Material Text :(.*?)Agreement / LineNo.", re.DOTALL)
-
-    items      = item_pat.findall(text)
-    short_txts = short_pat.findall(text)
-    po_txts    = po_pat.findall(text)
-
-    data = []
-    for i, itm in enumerate(items):
-        mat_no = itm[1] if itm[1].startswith(("B12", "12", "B16", "15")) else ""
-        data.append(
-            {
-                "RFx Number":  rfx_no,
-                "RFx Item No": itm[0],
-                "PR Item No":  "",
-                "Material No": mat_no,
-                "Description": short_txts[i] if i < len(short_txts) else "",
-                "PO Text":     po_txts[i]   if i < len(po_txts)   else "",
-                "QTY":         itm[2],
-                "UOM":         itm[4],
-            }
-        )
-    return data
-
-# ---------- Excel helpers ----------
-
-def workbook_to_bytes(wb):
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-cols_order = [
-    "RFx Number", "RFx Item No", "PR Item No", "Material No",
-    "Description", "PO Text", "QTY", "UOM",
-]
-
-def build_upload_wb(data: list[dict]):
-    df = pd.DataFrame(data, columns=cols_order)
-    buf = BytesIO(); df.to_excel(buf, index=False); buf.seek(0)
-    wb = load_workbook(buf)
-    ws = wb.active
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-        for c in row:
+def wrap_all(ws):
+    for r in ws.iter_rows():
+        for c in r:
             c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-    return wb
 
-def merge_into_template(template_path: str, upload_wb):
-    df = pd.read_excel(BytesIO(workbook_to_bytes(upload_wb)))
-    wb = load_workbook(template_path)
-    ws = wb.active
-    for r in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for c in r: c.value = None
+# ────────────────────────────────────────────────────────────────────────────────
+# 📄  PDF utilities
+# ────────────────────────────────────────────────────────────────────────────────
+def pdf_text(pdf):
+    rdr=PdfReader(pdf); return "".join(p.extract_text() for p in rdr.pages)
 
-    mapping = {"RFx Number": "A", "RFx Item No": "B", "PR Item No": "C", "Material No": "D",
-               "Description": "E", "PO Text": "F", "QTY": "G", "UOM": "H"}
-    for col_name, col_letter in mapping.items():
-        for i, val in enumerate(df[col_name], start=2):
-            ws[f"{col_letter}{i}"] = val
+def pdf_clean_body(pdf):
+    raw=pdf_text(pdf)
+    return re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)","",raw)
 
-    for row in ws.iter_rows():
-        for c in row:
-            c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-    return wb
+def parse_pdf(body, rfq_all):
+    rfx = re.search(r"RFQ Number (\d+)", rfq_all)
+    rfx_no = rfx.group(1) if rfx else "Unknown"
 
-def hts_to_final_sheet(upload_wb, final_template_path: str) -> bytes:
-    final_wb = load_workbook(final_template_path)
-    up_ws    = upload_wb.active
-    fi_ws    = final_wb.active
+    item_pat  = re.compile(r"(\d{5}) (\w?12\d{10}) (\d+(?:\.\d+)?)\s*(\w+) .*?(\d{2}\.\d{2}\.\d{4})",re.DOTALL)
+    short_pat = re.compile(r"Short Text :(.*?)\n",re.DOTALL)
+    po_pat    = re.compile(r"PO Material Text :(.*?)Agreement / LineNo.",re.DOTALL)
 
-    for r in fi_ws.iter_rows(min_row=2, max_row=fi_ws.max_row):
-        for c in r: c.value = None
+    items=item_pat.findall(body)
+    short=short_pat.findall(body)
+    po   =po_pat.findall(body)
 
-    paste = 2
-    for r in up_ws.iter_rows(min_row=2, max_row=up_ws.max_row):
-        if not any(cell.value for cell in r):
-            continue
-        fi_ws[f"A{paste}"] = r[1].value   # RFx Item No
-        fi_ws[f"B{paste}"] = r[4].value   # Description
-        fi_ws[f"C{paste}"] = r[6].value   # QTY
-        fi_ws[f"D{paste}"] = r[7].value   # UOM
-        po_text            = r[5].value or ""
-        fi_ws[f"E{paste}"] = format_text(po_text)
-        fi_ws[f"G{paste}"] = manufacture_name(po_text)
-        paste += 1
+    out=[]
+    for i,it in enumerate(items):
+        mat=it[1] if it[1].startswith(("B12","12","B16","15")) else ""
+        out.append({"RFx Number":rfx_no,
+                    "RFx Item No":it[0],
+                    "PR Item No":"",
+                    "Material No":mat,
+                    "Description":short[i] if i<len(short) else "",
+                    "PO Text":po[i] if i<len(po) else "",
+                    "QTY":it[2],
+                    "UOM":it[3]})
+    return out
 
-    for row in fi_ws.iter_rows():
-        for c in row:
-            c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-    return workbook_to_bytes(final_wb)
+# ────────────────────────────────────────────────────────────────────────────────
+# 🖥️  Streamlit page
+# ────────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Data Processor",layout="wide",
+                   initial_sidebar_state="collapsed")
 
-# ----------------------------
-# 🎈  STREAMLIT PAGE CONFIG
-# ----------------------------
-st.set_page_config(page_title="Data Processor", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+.stButton button{background:#ff914d;color:#fff;border-radius:8px;padding:10px 16px;margin-top:10px;}
+.stExpander{background:#333;border-radius:10px;}
+</style>""",unsafe_allow_html=True)
 
-st.markdown(
-    """
-    <style>
-    .stButton button{background:#ff914d;color:#fff;border-radius:8px;padding:10px 16px;margin-top:10px;}
-    .stExpander{background:#333;border-radius:10px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+col1,col2,col3 = st.columns([2,2,1])
 
-# --------------------------------------
-# ░█▀▀░█░█░█▀▀░█░█░█▀▄  COLUMN LAYOUT
-# --------------------------------------
-col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1.5])
-
-# ------------------------------------------------------
-# 1️⃣  EXCEL DATA PROCESSOR
-# ------------------------------------------------------
+# ──────────────────────────────────────────────────
+# 1️⃣  Excel → Upload + Final
+# ──────────────────────────────────────────────────
 with col1:
     st.subheader("🗃️ Excel Data Processor")
-    techno_file = st.file_uploader("Techno Commercial Envelope (.xls)", type=["xls"], key="techno_xls")
-    with st.expander("Upload Excel Templates", expanded=True):
-        upload_tpl = st.file_uploader("Upload File template (.xlsx)", type=["xlsx"], key="upl_tpl")
-        final_tpl  = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="fin_tpl")
-    upload_tpl  = upload_tpl or "upload file - HTS.xlsx"
-    final_tpl   = final_tpl  or "FINAL SHEET.xlsx"
+    techno = st.file_uploader("Techno-Commercial Envelope (.xls)",type=["xls"])
+    with st.expander("Excel templates",True):
+        upl_tpl = st.file_uploader("Upload template",type=["xlsx"])
+        fin_tpl = st.file_uploader("Final Sheet template",type=["xlsx"])
+    upl_tpl = upl_tpl or "upload file - HTS.xlsx"
+    fin_tpl = fin_tpl or "FINAL SHEET.xlsx"
 
-    if techno_file:
-        custom_name = st.text_input("Custom name for results", key="cust_name_excel")
-        if st.button("🚀 Process Excel", key="btn_excel") and custom_name:
+    if techno:
+        suffix = st.text_input("Output name suffix (no ext)")
+        save_to= st.text_input("Folder to save files")
+        if st.button("🚀 Process Excel") and suffix and save_to:
             try:
-                import re
-                rfx_no   = re.search(r"\d+", techno_file.name).group()
-                # keep_default_na=False to avoid NaNs
-                xls      = pd.ExcelFile(techno_file)
-                sheet_ok = next(
-                    (
-                        s
-                        for s in xls.sheet_names
-                        if all(
-                            c in pd.read_excel(xls, sheet_name=s).columns
-                            for c in ["Description", "InternalNote", "Quantity", "Unit of Measure"]
-                        )
-                    ),
-                    None,
-                )
+                rfx_no = re.search(r"\d+",techno.name).group()
+                xls = pd.ExcelFile(techno)
+                req = {'Description','InternalNote','Quantity','Unit of Measure'}
+                sheet_ok = next((s for s in xls.sheet_names
+                                 if req.issubset(set(pd.read_excel(xls,s,nrows=1).columns))),None)
                 if not sheet_ok:
-                    st.error("Template columns missing in uploaded XLS")
-                    st.stop()
-                df = pd.read_excel(techno_file, sheet_name=sheet_ok, keep_default_na=False)
+                    st.error("Required columns missing"); st.stop()
 
-                # Build Upload workbook
-                wb_upl = load_workbook(upload_tpl)
-                ws_upl = wb_upl.active
-                for r in ws_upl.iter_rows(min_row=2, max_row=ws_upl.max_row):
-                    for c in r: c.value = None
-                row = 2; item = 10
-                for _, rec in df.iterrows():
-                    if rec["Description"]:
-                        ws_upl[f"A{row}"] = rfx_no
-                        ws_upl[f"B{row}"] = item
-                        ws_upl[f"E{row}"] = rec["Description"]
-                        ws_upl[f"H{row}"] = rec["Unit of Measure"]
-                        ws_upl[f"G{row}"] = rec["Quantity"]
-                        ws_upl[f"F{row}"] = rec["InternalNote"]
-                        item += 10; row += 1
-                for r in ws_upl.iter_rows():
-                    for c in r: c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-                st.download_button(
-                    "📥 Download Upload File",
-                    workbook_to_bytes(wb_upl),
-                    file_name=f"upload file - {custom_name}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                df = pd.read_excel(techno,sheet_name=sheet_ok, keep_default_na=False)
 
-                # Build FINAL SHEET
-                wb_fin = load_workbook(final_tpl)
-                ws_fin = wb_fin.active
-                for r in ws_fin.iter_rows(min_row=2, max_row=ws_fin.max_row):
-                    for c in r: c.value = None
+                # ─── filter out placeholder / empty rows ───────────────────────
+                valid = df[
+                    (df['Description'].str.strip().str.lower()!='item or lot description') &
+                    df['Quantity'].astype(str).str.strip().ne('') &
+                    df['Unit of Measure'].astype(str).str.strip().ne('')]
 
-                row = 2; item = 10
-                for _, rec in df.iterrows():
-                    if rec["Description"]:
-                        ws_fin[f"A{row}"] = item
-                        ws_fin[f"B{row}"] = rec["Description"]
-                        ws_fin[f"C{row}"] = rec["Quantity"]
-                        ws_fin[f"D{row}"] = rec["Unit of Measure"]
-                        po = rec["InternalNote"]
-                        ws_fin[f"E{row}"] = format_text(po)
-                        ws_fin[f"G{row}"] = manufacture_name(po)
-                        item += 10; row += 1
-                for r in ws_fin.iter_rows():
-                    for c in r: c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-                st.download_button(
-                    "📥 Download FINAL SHEET",
-                    workbook_to_bytes(wb_fin),
-                    file_name=f"FINAL SHEET - {custom_name}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.success("Excel processed ✔️")
+                # ─── build Upload workbook ────────────────────────────────────
+                wb_u = load_workbook(upl_tpl); ws_u=wb_u.active
+                for r in ws_u.iter_rows(min_row=2,max_row=ws_u.max_row):
+                    for c in r: c.value=None
+
+                row,item = 2,10
+                for _,rec in valid.iterrows():
+                    ws_u[f"A{row}"]=rfx_no
+                    ws_u[f"B{row}"]=item
+                    ws_u[f"E{row}"]=rec['Description']
+                    ws_u[f"H{row}"]=rec['Unit of Measure']
+                    ws_u[f"G{row}"]=rec['Quantity']
+                    ws_u[f"F{row}"]=rec['InternalNote']
+                    item+=10; row+=1
+                wrap_all(ws_u)
+
+                up_path = os.path.join(save_to,f"upload file - {suffix}.xlsx")
+                wb_u.save(up_path)
+
+                # ─── build FINAL SHEET ────────────────────────────────────────
+                wb_f = load_workbook(fin_tpl); ws_f=wb_f.active
+                for r in ws_f.iter_rows(min_row=2,max_row=ws_f.max_row):
+                    for c in r: c.value=None
+
+                row,item=2,10
+                for _,rec in valid.iterrows():
+                    ws_f[f"A{row}"]=item
+                    ws_f[f"B{row}"]=rec['Description']
+                    ws_f[f"C{row}"]=rec['Quantity']
+                    ws_f[f"D{row}"]=rec['Unit of Measure']
+                    po=rec['InternalNote']
+                    ws_f[f"E{row}"]=format_text(po)
+                    ws_f[f"G{row}"]=manufacture_name(po)
+                    item+=10; row+=1
+                wrap_all(ws_f)
+
+                fin_path = os.path.join(save_to,f"FINAL SHEET - {suffix}.xlsx")
+                wb_f.save(fin_path)
+                st.success(f"✅ Saved:\n{up_path}\n{fin_path}")
             except Exception as e:
-                st.error(f"❌ Error: {e}")
+                st.error(f"❌ {e}")
 
-# --------------------------------------------------
-# 2️⃣  PDF DATA PROCESSOR
-# --------------------------------------------------
+# ──────────────────────────────────────────────────
+# 2️⃣  PDF → Upload + Final
+# ──────────────────────────────────────────────────
 with col2:
     st.subheader("📑 PDF Data Processor")
-    pdf_file = st.file_uploader("RFQ PDF", type=["pdf"], key="pdf_main")
-    with st.expander("Upload Excel templates", expanded=True):
-        raw_tpl   = st.file_uploader("Raw template (.xlsx)", type=["xlsx"], key="raw_tpl_pdf")
-        hts_tpl   = st.file_uploader("HTS template (.xlsx)", type=["xlsx"], key="hts_tpl_pdf")
-        fin_tpl_p = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="fin_tpl_pdf")
-    raw_tpl   = raw_tpl   or "raw_template.xlsx"
-    hts_tpl   = hts_tpl   or "upload file - HTS.xlsx"
+    pdf = st.file_uploader("RFQ PDF",type=["pdf"])
+    with st.expander("Excel templates",True):
+        raw_tpl = st.file_uploader("Raw template",type=["xlsx"])
+        hts_tpl = st.file_uploader("HTS template",type=["xlsx"])
+        fin_tpl_p = st.file_uploader("Final Sheet template",type=["xlsx"])
+    raw_tpl = raw_tpl or "raw_template.xlsx"
+    hts_tpl = hts_tpl or "upload file - HTS.xlsx"
     fin_tpl_p = fin_tpl_p or "FINAL SHEET.xlsx"
 
-    if pdf_file:
-        hts_no = st.text_input("HTS number", key="hts_num_pdf")
-        if st.button("🚀 Process PDF", key="btn_pdf") and hts_no:
+    if pdf:
+        hts_no = st.text_input("HTS number")
+        save_to= st.text_input("Folder to save files")
+        if st.button("🚀 Process PDF") and hts_no and save_to:
             try:
-                # temp paths
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as t_upl, tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as t_fin:
-                    t_upl_path, t_fin_path = t_upl.name, t_fin.name
+                data = parse_pdf(pdf_clean_body(pdf), pdf_text(pdf))
+                # build upload workbook from data
+                wb_up = load_workbook(hts_tpl); ws=wb_up.active
+                for r in ws.iter_rows(min_row=2,max_row=ws.max_row):
+                    for c in r: c.value=None
+                row=2
+                for rec in data:
+                    for col,letter in zip(
+                       ["RFx Number","RFx Item No","PR Item No","Material No",
+                        "Description","PO Text","QTY","UOM"],
+                       list("ABCD") + list("EFGH")):
+                        ws[f"{letter}{row}"]=rec[col]
+                    row+=1
+                wrap_all(ws)
 
-                # ---------------- PDF ➜ Upload file ----------------
-                rfq_text = extract_rfq_from_pdf(pdf_file)
-                data     = parse_text(extract_text_from_pdf(pdf_file), rfq_text)
-                wb_upload = build_upload_wb(data)
-                wb_upload.save(t_upl_path)
+                up_path=os.path.join(save_to,f"upload file - {hts_no}.xlsx")
+                wb_up.save(up_path)
 
-                # ---------------- Upload ➜ Final sheet ----------------
-                wb_final = merge_into_template(fin_tpl_p, wb_upload)
-                wb_final.save(t_fin_path)
+                # build final sheet from upload workbook
+                wb_fin = load_workbook(fin_tpl_p); wsf=wb_fin.active
+                for r in wsf.iter_rows(min_row=2,max_row=wsf.max_row):
+                    for c in r: c.value=None
 
-                upl_bytes = open(t_upl_path, "rb").read()
-                fin_bytes = open(t_fin_path, "rb").read()
+                row=2
+                for rec in data:
+                    wsf[f"A{row}"]=rec['RFx Item No']
+                    wsf[f"B{row}"]=rec['Description']
+                    wsf[f"C{row}"]=rec['QTY']
+                    wsf[f"D{row}"]=rec['UOM']
+                    wsf[f"E{row}"]=format_text(rec['PO Text'])
+                    wsf[f"G{row}"]=manufacture_name(rec['PO Text'])
+                    row+=1
+                wrap_all(wsf)
 
-                st.download_button(
-                    "📥 Download Upload File",
-                    upl_bytes,
-                    file_name=f"upload file - {hts_no}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.download_button(
-                    "📥 Download FINAL SHEET",
-                    fin_bytes,
-                    file_name=f"FINAL SHEET - {hts_no}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.success("PDF processed ✔️")
+                fin_path=os.path.join(save_to,f"FINAL SHEET - {hts_no}.xlsx")
+                wb_fin.save(fin_path)
+                st.success(f"✅ Saved:\n{up_path}\n{fin_path}")
             except Exception as e:
-                st.error(f"❌ Error: {e}")
+                st.error(f"❌ {e}")
 
-# --------------------------------------------------
-# 3️⃣  HTS CLEANER
-# --------------------------------------------------
+# ──────────────────────────────────────────────────
+# 3️⃣  HTS Cleaner  &  List-maker
+# ──────────────────────────────────────────────────
 with col3:
     st.subheader("🧹 HTS Cleaner")
-    hts_upload   = st.file_uploader("Upload *upload file – HTS.xlsx*", type=["xlsx"], key="hts_clean_upload")
-    fin_tpl_opt  = st.file_uploader("Final Sheet template (.xlsx) – optional", type=["xlsx"], key="hts_clean_fin_tpl")
-    fin_tpl_opt  = fin_tpl_opt or "FINAL SHEET.xlsx"
+    hts_up = st.file_uploader("upload file – HTS.xlsx",type=["xlsx"])
+    fin_tpl_opt = st.file_uploader("Final Sheet template (opt)",type=["xlsx"])
+    fin_tpl_opt = fin_tpl_opt or "FINAL SHEET.xlsx"
+    if hts_up and st.button("🚀 Clean HTS"):
+        try:
+            wb_up = load_workbook(hts_up)
+            wb_fin = load_workbook(fin_tpl_opt); wsf=wb_fin.active
+            for r in wsf.iter_rows(min_row=2,max_row=wsf.max_row):
+                for c in r: c.value=None
+            up_ws = wb_up.active
+            row=2
+            for r in up_ws.iter_rows(min_row=2,max_row=up_ws.max_row):
+                if not any(c.value for c in r): continue
+                wsf[f"A{row}"]=r[1].value
+                wsf[f"B{row}"]=r[4].value
+                wsf[f"C{row}"]=r[6].value
+                wsf[f"D{row}"]=r[7].value
+                po=r[5].value or ""
+                wsf[f"E{row}"]=format_text(po)
+                wsf[f"G{row}"]=manufacture_name(po)
+                row+=1
+            wrap_all(wsf)
+            st.download_button("📥 Download cleaned FINAL SHEET",
+                               workbook_bytes(wb_fin),
+                               file_name="FINAL SHEET - cleaned.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(f"❌ {e}")
 
-    if hts_upload:
-        clean_name = st.text_input("Output file name suffix", value="Cleaned", key="clean_name")
-        if st.button("🚀 Clean HTS", key="btn_clean"):
-            try:
-                wb_up  = load_workbook(hts_upload)
-                final_bytes = hts_to_final_sheet(wb_up, fin_tpl_opt)
-                st.download_button(
-                    "📥 Download FINAL SHEET",
-                    final_bytes,
-                    file_name=f"FINAL SHEET - {clean_name}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                st.success("HTS cleaned ✔️")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-
-# --------------------------------------------------
-# 4️⃣  LIST MAKER (Manufacturer summary)
-# --------------------------------------------------
-# (You can continue your additional features here)
+    st.subheader("📝 List Maker")
+    final_xlsx = st.file_uploader("FINAL SHEET for manufacturers",type=["xlsx"])
+    if final_xlsx and st.button("🚀 Build list"):
+        try:
+            df=pd.read_excel(final_xlsx)
+            out=defaultdict(lambda:{"items":[],"emails":[]})
+            for _,row in df.iterrows():
+                mans=_clean(row.get("Manufacturer",""))
+                if not mans: continue
+                items=row["Line item number"]
+                emails=[row[c] for c in df.columns
+                        if ("mail" in c.lower() or "unnamed" in c.lower()) and
+                           pd.notna(row[c])]
+                for m in [m.strip() for m in mans.split("-")]:
+                    out[m]["items"].append(items)
+                    out[m]["emails"].extend(emails)
+            blob=[]
+            for m,v in out.items():
+                blob.append(f"Item {', '.join(map(str,sorted(set(v['items']))))}: {m}")
+                if v["emails"]:
+                    blob.append("\n".join(v["emails"]))
+                blob.append("")
+            final="\n".join(blob)
+            st.text_area("Output",final,height=300)
+            from st_copy_to_clipboard import st_copy_to_clipboard
+            st_copy_to_clipboard(final)
+        except Exception as e:
+            st.error(f"❌ {e}")
