@@ -146,6 +146,7 @@ with col1:
                     ws_u[f"H{row}"]=rec['Unit of Measure']
                     ws_u[f"G{row}"]=rec['Quantity']
                     ws_u[f"F{row}"]=rec['InternalNote']
+                    ws_u[f"I{row}"] = rec.get('Number', '')      # ← fills ARIBA Number
                     item+=10; row+=1
                 wrap_all(ws_u)
 
