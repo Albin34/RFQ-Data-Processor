@@ -15,7 +15,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_excep
 # ══════════════════════════════════════
 # 🔑  API & model
 # ══════════════════════════════════════
-API_KEY = "MoYnS046nk9Z8WvGs2f057o27ZdP5TO9"
+API_KEY = "s3iccyD3z5Hdtdj60kzUdPA6eRezQlRy"
 MODEL   = "mistral-large-latest"
 client  = Mistral(api_key=API_KEY)
 
@@ -43,7 +43,7 @@ def wrap_all(ws):
        retry=retry_if_exception_type(Exception))
 def _fmt_uncached(txt):
     res = client.agents.complete(
-        agent_id="ag:9d0568a2:20250612:cleaner:12c5f2da",
+        agent_id="ag:934c59a8:20250930:untitled-agent:03cdf810",
         messages=[{"role": "user", "content": txt}],
     )
     return re.sub(r"[`]+", "", res.choices[0].message.content)
