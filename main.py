@@ -8,7 +8,7 @@ import pandas as pd
 from PyPDF2 import PdfReader
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
-from mistralai import Mistral
+from mistralai.client import Mistral
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 
