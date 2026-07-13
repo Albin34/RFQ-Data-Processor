@@ -29,7 +29,7 @@ from tenacity import (
 st.set_page_config(
     page_title="RFQ Data Processor",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
