@@ -57,7 +57,7 @@ st.markdown(
 # ============================================================
 # Since you said you can only change GitHub code, paste the new key here.
 # IMPORTANT: A key committed to a public repository is visible to everyone.
-API_KEY = "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
+API_KEY = "PMFVLvTCzWBM5E2zZam3PGxwVuUfy3K9"
 
 MODEL = "mistral-medium-3-5"
 
