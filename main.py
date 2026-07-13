@@ -32,6 +32,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+if "show_diagnostics" not in st.session_state:
+    st.session_state.show_diagnostics = False
+
 st.markdown(
     """
     <style>
@@ -249,69 +252,129 @@ def get_message_content(response) -> str:
 # ============================================================
 # Mistral diagnostics
 # ============================================================
-with st.sidebar:
-    st.header("API Diagnostics")
-    st.caption(
-        "Run these tests before processing a file. "
-        "The app now uses a supported chat model instead of the retired Agent model."
+# The diagnostics sidebar is fully hidden unless the user clicks the button.
+# CSS is used because Streamlit may restore a previously opened sidebar state.
+if st.session_state.show_diagnostics:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            display: block !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+
+        [data-testid="collapsedControl"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    masked_key = (
-        f"{API_KEY[:4]}...{API_KEY[-4:]}"
-        if len(API_KEY) >= 10
-        else "Configured"
-    )
-    st.write(f"API key: `{masked_key}`")
-    st.write(f"Formatting model: `{MODEL}`")
+    with st.sidebar:
+        st.header("API Diagnostics")
 
-    if st.button("1. Test standard chat API", key="test_chat_api"):
-        try:
-            response = client.chat.complete(
-                model=MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "Reply with exactly: CHAT API OK",
-                    }
-                ],
-                temperature=0,
-            )
-            st.success(get_message_content(response))
-        except Exception as exc:
-            show_api_error("Standard chat API test failed", exc)
+        if st.button(
+            "Close Diagnostics",
+            key="close_diagnostics",
+            use_container_width=True,
+        ):
+            st.session_state.show_diagnostics = False
+            st.rerun()
 
-    if st.button("2. Test RFQ formatting", key="test_format_api"):
-        try:
-            response = client.chat.complete(
-                model=MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": FORMAT_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Basic Data Text:\n"
-                            "VALVE, SOLENOID\n"
-                            "PRESSURE RATING: 320 BAR\n"
-                            "MANUFACTURER: DANA CORPORATION"
-                        ),
-                    },
-                ],
-                temperature=0,
-            )
+        st.caption(
+            "Run these tests before processing a file. "
+            "The app uses a supported chat model."
+        )
 
-            st.success("RFQ formatting test succeeded.")
-            st.code(get_message_content(response), language="text")
-        except Exception as exc:
-            show_api_error("RFQ formatting test failed", exc)
+        masked_key = (
+            f"{API_KEY[:4]}...{API_KEY[-4:]}"
+            if len(API_KEY) >= 10
+            else "Configured"
+        )
 
-    st.info(
-        "Interpretation:\n\n"
-        "- Both tests succeed: the API and formatting model are working.\n"
-        "- Both tests fail: check the API key, billing, quota, or model access.\n"
-        "- Chat succeeds but formatting fails: review prompt.txt or the returned error."
+        st.write(f"API key: `{masked_key}`")
+        st.write(f"Formatting model: `{MODEL}`")
+
+        if st.button(
+            "1. Test standard chat API",
+            key="test_chat_api",
+            use_container_width=True,
+        ):
+            try:
+                response = client.chat.complete(
+                    model=MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "Reply with exactly: CHAT API OK",
+                        }
+                    ],
+                    temperature=0,
+                )
+                st.success(get_message_content(response))
+            except Exception as exc:
+                show_api_error("Standard chat API test failed", exc)
+
+        if st.button(
+            "2. Test RFQ formatting",
+            key="test_format_api",
+            use_container_width=True,
+        ):
+            try:
+                response = client.chat.complete(
+                    model=MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": FORMAT_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Basic Data Text:\n"
+                                "VALVE, SOLENOID\n"
+                                "PRESSURE RATING: 320 BAR\n"
+                                "MANUFACTURER: DANA CORPORATION"
+                            ),
+                        },
+                    ],
+                    temperature=0,
+                )
+
+                st.success("RFQ formatting test succeeded.")
+                st.code(get_message_content(response), language="text")
+            except Exception as exc:
+                show_api_error("RFQ formatting test failed", exc)
+
+        st.info(
+            "Interpretation:\n\n"
+            "- Both tests succeed: the API and formatting model are working.\n"
+            "- Both tests fail: check the API key, billing, quota, or model access.\n"
+            "- Chat succeeds but formatting fails: review prompt.txt or the returned error."
+        )
+
+else:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            display: none !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+
+        [data-testid="collapsedControl"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -502,6 +565,17 @@ def parse_pdf(body: str, full_rfq_text: str) -> list[dict]:
 # ============================================================
 # Main UI
 # ============================================================
+top_left, top_right = st.columns([1, 7])
+
+with top_left:
+    if st.button(
+        "API Diagnostics",
+        key="open_diagnostics",
+        use_container_width=True,
+    ):
+        st.session_state.show_diagnostics = True
+        st.rerun()
+
 col1, col2, col3 = st.columns([2, 2, 1])
 
 
