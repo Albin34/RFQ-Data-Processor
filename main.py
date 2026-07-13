@@ -56,14 +56,22 @@ st.markdown(
 # ============================================================
 # Since you said you can only change GitHub code, paste the new key here.
 # IMPORTANT: A key committed to a public repository is visible to everyone.
-API_KEY = "PMFVLvTCzWBM5E2zZam3PGxwVuUfy3K9"
+API_KEY = "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
 
-MODEL = "mistral-large-latest"
+MODEL = "mistral-medium-3-5"
 
-# Keep the existing agent for diagnostic testing.
-# This code will reveal whether the agent is missing, inaccessible,
-# invalid for the new account/workspace, or failing for another reason.
-FORMAT_AGENT_ID = "ag:934c59a8:20250930:untitled-agent:03cdf810"
+# Formatting instructions are stored in prompt.txt in the same GitHub folder.
+PROMPT_PATH = Path(__file__).with_name("prompt.txt")
+
+try:
+    FORMAT_PROMPT = PROMPT_PATH.read_text(encoding="utf-8").strip()
+except OSError as exc:
+    st.error(f"Unable to load prompt.txt: {exc}")
+    st.stop()
+
+if not FORMAT_PROMPT:
+    st.error("prompt.txt is empty. Add the RFQ formatting instructions.")
+    st.stop()
 
 
 def api_key_is_configured() -> bool:
@@ -244,7 +252,7 @@ with st.sidebar:
     st.header("API Diagnostics")
     st.caption(
         "Run these tests before processing a file. "
-        "They display the real SDK/API error instead of only RetryError."
+        "The app now uses a supported chat model instead of the retired Agent model."
     )
 
     masked_key = (
@@ -253,8 +261,7 @@ with st.sidebar:
         else "Configured"
     )
     st.write(f"API key: `{masked_key}`")
-    st.write(f"Model: `{MODEL}`")
-    st.write(f"Formatting agent: `{FORMAT_AGENT_ID}`")
+    st.write(f"Formatting model: `{MODEL}`")
 
     if st.button("1. Test standard chat API", key="test_chat_api"):
         try:
@@ -272,29 +279,38 @@ with st.sidebar:
         except Exception as exc:
             show_api_error("Standard chat API test failed", exc)
 
-    if st.button("2. Test formatting agent", key="test_agent_api"):
+    if st.button("2. Test RFQ formatting", key="test_format_api"):
         try:
-            response = client.agents.complete(
-                agent_id=FORMAT_AGENT_ID,
+            response = client.chat.complete(
+                model=MODEL,
                 messages=[
+                    {
+                        "role": "system",
+                        "content": FORMAT_PROMPT,
+                    },
                     {
                         "role": "user",
                         "content": (
-                            "This is a connection test. "
-                            "Reply with exactly: AGENT API OK"
+                            "Basic Data Text:\n"
+                            "VALVE, SOLENOID\n"
+                            "PRESSURE RATING: 320 BAR\n"
+                            "MANUFACTURER: DANA CORPORATION"
                         ),
-                    }
+                    },
                 ],
+                temperature=0,
             )
-            st.success(get_message_content(response))
+
+            st.success("RFQ formatting test succeeded.")
+            st.code(get_message_content(response), language="text")
         except Exception as exc:
-            show_api_error("Formatting agent test failed", exc)
+            show_api_error("RFQ formatting test failed", exc)
 
     st.info(
         "Interpretation:\n\n"
-        "- Chat succeeds + Agent fails: the Agent ID/access is the problem.\n"
-        "- Both fail: key, billing, quota, model access, network, or SDK issue.\n"
-        "- Both succeed: the problem is likely the input, rate limit, or processing flow."
+        "- Both tests succeed: the API and formatting model are working.\n"
+        "- Both tests fail: check the API key, billing, quota, or model access.\n"
+        "- Chat succeeds but formatting fails: review prompt.txt or the returned error."
     )
 
 
@@ -310,25 +326,33 @@ with st.sidebar:
 )
 def _fmt_uncached(text: str) -> str:
     """
-    Uses the existing Mistral Agent so we can determine the real failure.
-    reraise=True exposes the original SDKError instead of RetryError.
+    Format RFQ text using a supported Mistral chat model and prompt.txt.
     """
     cleaned = _clean(text)
 
     if not cleaned:
         return ""
 
-    response = client.agents.complete(
-        agent_id=FORMAT_AGENT_ID,
+    response = client.chat.complete(
+        model=MODEL,
         messages=[
+            {
+                "role": "system",
+                "content": FORMAT_PROMPT,
+            },
             {
                 "role": "user",
                 "content": cleaned,
-            }
+            },
         ],
+        temperature=0,
     )
 
     result = get_message_content(response)
+
+    if not result:
+        raise ValueError("Mistral returned an empty formatting response.")
+
     return re.sub(r"`+", "", result).strip()
 
 
