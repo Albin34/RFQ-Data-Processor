@@ -1,8 +1,11 @@
 # main.py
 import functools
+import json
 import math
 import os
 import re
+import threading
+import time
 import traceback
 from collections import defaultdict
 from copy import copy
@@ -21,7 +24,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-
 
 # ============================================================
 # Streamlit page setup
@@ -54,15 +56,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # ============================================================
 # API configuration
 # ============================================================
-# Since you said you can only change GitHub code, paste the new key here.
-# IMPORTANT: A key committed to a public repository is visible to everyone.
+# Keep your existing hard-coded Mistral API key here for now.
+# Replace the placeholder below with the same API key currently in your app.
 API_KEY = "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT"
 
 MODEL = "mistral-medium-3-5"
+
+# The current organization limit shown for the Medium model is 1 request/sec.
+# 1.20 seconds gives a safety margin and keeps the app below that burst rate.
+MISTRAL_MIN_INTERVAL_SECONDS = 1.20
 
 # Formatting instructions are stored in prompt.txt in the same GitHub folder.
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
@@ -82,19 +87,59 @@ def api_key_is_configured() -> bool:
     return bool(
         API_KEY
         and API_KEY.strip()
+        and API_KEY != "PASTE_YOUR_EXISTING_MISTRAL_API_KEY_HERE"
         and API_KEY != "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
     )
 
 
 if not api_key_is_configured():
     st.error(
-        "Mistral API key is not configured. Open main.py in GitHub and replace "
-        'API_KEY = "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE" with your valid key.'
+        "Mistral API key is not configured. Open main.py and put your existing "
+        "API key in the API_KEY variable."
     )
     st.stop()
 
-
 client = Mistral(api_key=API_KEY.strip())
+
+
+# ============================================================
+# Application-wide Mistral rate limiter
+# ============================================================
+@st.cache_resource
+def get_mistral_rate_limiter():
+    """
+    Shared across Streamlit sessions in this app process.
+
+    The lock serializes Mistral calls and last_request_started stores the
+    monotonic timestamp at which the previous API request began.
+    """
+    return {
+        "lock": threading.Lock(),
+        "last_request_started": 0.0,
+    }
+
+
+MISTRAL_RATE_LIMITER = get_mistral_rate_limiter()
+
+
+def throttled_chat_complete(**kwargs):
+    """
+    Execute client.chat.complete while enforcing a minimum interval between
+    the start of any two Mistral API calls across the application.
+    """
+    with MISTRAL_RATE_LIMITER["lock"]:
+        now = time.monotonic()
+        elapsed = now - MISTRAL_RATE_LIMITER["last_request_started"]
+        remaining = MISTRAL_MIN_INTERVAL_SECONDS - elapsed
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+        # Record immediately before the request starts. This controls request
+        # start rate rather than adding an unnecessary full delay after slow
+        # API responses.
+        MISTRAL_RATE_LIMITER["last_request_started"] = time.monotonic()
+        return client.chat.complete(**kwargs)
 
 
 # ============================================================
@@ -227,7 +272,6 @@ def extract_exception_details(exc: Exception) -> str:
 
 def show_api_error(title: str, exc: Exception) -> None:
     st.error(f"{title}: {type(exc).__name__}: {exc!s}")
-
     with st.expander(f"Detailed diagnostic: {title}", expanded=True):
         st.code(extract_exception_details(exc), language="text")
 
@@ -249,6 +293,170 @@ def get_message_content(response) -> str:
     return str(content).strip()
 
 
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _parse_combined_response(raw_response: str, original_text: str) -> tuple[str, str]:
+    """
+    Parse the single Mistral response containing both formatted RFQ text and
+    manufacturer names.
+
+    Expected response:
+    {
+      "formatted_text": "...",
+      "manufacturer": "Maker A - Maker B"
+    }
+    """
+    cleaned_response = _strip_code_fence(raw_response)
+
+    # If Mistral adds a short sentence around the JSON, isolate the object.
+    first_brace = cleaned_response.find("{")
+    last_brace = cleaned_response.rfind("}")
+
+    if first_brace < 0 or last_brace <= first_brace:
+        raise ValueError(
+            "Mistral did not return the expected JSON object. "
+            f"Raw response: {cleaned_response[:1000]}"
+        )
+
+    json_text = cleaned_response[first_brace : last_brace + 1]
+
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Could not parse Mistral combined response as JSON. "
+            f"Raw response: {cleaned_response[:1000]}"
+        ) from exc
+
+    formatted_text = _clean(payload.get("formatted_text", ""))
+    manufacturer = payload.get("manufacturer", "")
+
+    if isinstance(manufacturer, list):
+        manufacturer = " - ".join(
+            _clean(item) for item in manufacturer if _clean(item)
+        )
+    else:
+        manufacturer = _clean(manufacturer)
+
+    # Preserve previous behavior if the model somehow returns an empty
+    # formatted_text field.
+    if not formatted_text:
+        formatted_text = original_text
+
+    formatted_text = re.sub(r"`+", "", formatted_text).strip()
+    manufacturer = re.sub(r"`+", "", manufacturer).strip()
+
+    return formatted_text, manufacturer
+
+
+# ============================================================
+# Mistral combined RFQ processing
+# ============================================================
+COMBINED_OUTPUT_INSTRUCTIONS = """
+In addition to the RFQ formatting instructions above, perform one more task:
+extract the manufacturer or maker name(s) from the same RFQ text.
+
+Return ONLY a valid JSON object using exactly these keys:
+{
+  "formatted_text": "the fully formatted RFQ text",
+  "manufacturer": "manufacturer names separated by hyphens"
+}
+
+Rules for the manufacturer field:
+- Extract only manufacturer or maker names explicitly present in the RFQ text.
+- If multiple manufacturers/makers are present, separate them with:  -  
+- Do not add explanations, labels, part numbers, model numbers, countries, or
+  other commentary to the manufacturer field.
+- If no manufacturer or maker is stated, return an empty string.
+
+Rules for formatted_text:
+- Follow all formatting instructions from the main system prompt.
+- Do not omit technical information from the RFQ text.
+- Do not put Markdown code fences around the JSON.
+""".strip()
+
+
+@functools.lru_cache(maxsize=1024)
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _process_rfq_uncached(text: str) -> tuple[str, str]:
+    """
+    ONE Mistral request for one RFQ item.
+
+    Returns:
+        (formatted_text, manufacturer)
+    """
+    cleaned = _clean(text)
+
+    if not cleaned:
+        return "", ""
+
+    response = throttled_chat_complete(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    FORMAT_PROMPT
+                    + "\n\n"
+                    + COMBINED_OUTPUT_INSTRUCTIONS
+                ),
+            },
+            {
+                "role": "user",
+                "content": cleaned,
+            },
+        ],
+        temperature=0,
+    )
+
+    raw_result = get_message_content(response)
+
+    if not raw_result:
+        raise ValueError("Mistral returned an empty RFQ-processing response.")
+
+    return _parse_combined_response(raw_result, cleaned)
+
+
+def process_rfq_text(text) -> tuple[str, str]:
+    """
+    Safe public wrapper used by all three processors.
+
+    On API failure, the original RFQ text is kept and manufacturer is blank,
+    so workbook creation can continue.
+    """
+    cleaned = _clean(text)
+
+    if not cleaned:
+        return "", ""
+
+    try:
+        return _process_rfq_uncached(cleaned)
+    except Exception as exc:
+        show_api_error("RFQ AI processing failed", exc)
+        return cleaned, ""
+
+
+# Compatibility wrappers. New processing loops below call process_rfq_text()
+# once and unpack both values, but these are kept in case another part of the
+# project imports the old function names.
+def format_text(text) -> str:
+    return process_rfq_text(text)[0]
+
+
+def manufacture_name(text) -> str:
+    return process_rfq_text(text)[1]
+
+
 # ============================================================
 # Mistral diagnostics
 # ============================================================
@@ -261,11 +469,9 @@ if st.session_state.show_diagnostics:
         [data-testid="stSidebar"] {
             display: block !important;
         }
-
         [data-testid="stSidebarCollapsedControl"] {
             display: none !important;
         }
-
         [data-testid="collapsedControl"] {
             display: none !important;
         }
@@ -286,8 +492,8 @@ if st.session_state.show_diagnostics:
             st.rerun()
 
         st.caption(
-            "Run these tests before processing a file. "
-            "The app uses a supported chat model."
+            "All diagnostic requests use the same application-wide "
+            f"{MISTRAL_MIN_INTERVAL_SECONDS:.2f}-second Mistral throttle."
         )
 
         masked_key = (
@@ -295,9 +501,12 @@ if st.session_state.show_diagnostics:
             if len(API_KEY) >= 10
             else "Configured"
         )
-
         st.write(f"API key: `{masked_key}`")
         st.write(f"Formatting model: `{MODEL}`")
+        st.write(
+            "Minimum interval: "
+            f"`{MISTRAL_MIN_INTERVAL_SECONDS:.2f} seconds/request`"
+        )
 
         if st.button(
             "1. Test standard chat API",
@@ -305,7 +514,7 @@ if st.session_state.show_diagnostics:
             use_container_width=True,
         ):
             try:
-                response = client.chat.complete(
+                response = throttled_chat_complete(
                     model=MODEL,
                     messages=[
                         {
@@ -320,41 +529,33 @@ if st.session_state.show_diagnostics:
                 show_api_error("Standard chat API test failed", exc)
 
         if st.button(
-            "2. Test RFQ formatting",
+            "2. Test combined RFQ processing",
             key="test_format_api",
             use_container_width=True,
         ):
             try:
-                response = client.chat.complete(
-                    model=MODEL,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": FORMAT_PROMPT,
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Basic Data Text:\n"
-                                "VALVE, SOLENOID\n"
-                                "PRESSURE RATING: 320 BAR\n"
-                                "MANUFACTURER: DANA CORPORATION"
-                            ),
-                        },
-                    ],
-                    temperature=0,
+                sample_text = (
+                    "Basic Data Text:\n"
+                    "VALVE, SOLENOID\n"
+                    "PRESSURE RATING: 320 BAR\n"
+                    "MANUFACTURER: DANA CORPORATION"
                 )
-
-                st.success("RFQ formatting test succeeded.")
-                st.code(get_message_content(response), language="text")
+                formatted, manufacturer = _process_rfq_uncached(sample_text)
+                st.success("Combined RFQ processing test succeeded.")
+                st.write("Formatted text:")
+                st.code(formatted, language="text")
+                st.write(f"Manufacturer: `{manufacturer}`")
             except Exception as exc:
-                show_api_error("RFQ formatting test failed", exc)
+                show_api_error("Combined RFQ processing test failed", exc)
 
         st.info(
             "Interpretation:\n\n"
-            "- Both tests succeed: the API and formatting model are working.\n"
-            "- Both tests fail: check the API key, billing, quota, or model access.\n"
-            "- Chat succeeds but formatting fails: review prompt.txt or the returned error."
+            "- Both tests succeed: the API, throttle, model and combined "
+            "processing are working.\n"
+            "- Both tests fail: check the API key, billing, quota or model "
+            "access.\n"
+            "- Chat succeeds but combined processing fails: review prompt.txt "
+            "or the returned JSON/diagnostic error."
         )
 
 else:
@@ -364,11 +565,9 @@ else:
         [data-testid="stSidebar"] {
             display: none !important;
         }
-
         [data-testid="stSidebarCollapsedControl"] {
             display: none !important;
         }
-
         [data-testid="collapsedControl"] {
             display: none !important;
         }
@@ -376,106 +575,6 @@ else:
         """,
         unsafe_allow_html=True,
     )
-
-
-# ============================================================
-# Mistral processing wrappers
-# ============================================================
-@functools.lru_cache(maxsize=1024)
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type(Exception),
-    reraise=True,
-)
-def _fmt_uncached(text: str) -> str:
-    """
-    Format RFQ text using a supported Mistral chat model and prompt.txt.
-    """
-    cleaned = _clean(text)
-
-    if not cleaned:
-        return ""
-
-    response = client.chat.complete(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": FORMAT_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": cleaned,
-            },
-        ],
-        temperature=0,
-    )
-
-    result = get_message_content(response)
-
-    if not result:
-        raise ValueError("Mistral returned an empty formatting response.")
-
-    return re.sub(r"`+", "", result).strip()
-
-
-def format_text(text) -> str:
-    cleaned = _clean(text)
-
-    if not cleaned:
-        return ""
-
-    try:
-        return _fmt_uncached(cleaned)
-    except Exception as exc:
-        show_api_error("Format-text request failed", exc)
-        return cleaned
-
-
-@functools.lru_cache(maxsize=1024)
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type(Exception),
-    reraise=True,
-)
-def _manu_uncached(text: str) -> str:
-    cleaned = _clean(text)
-
-    if not cleaned:
-        return ""
-
-    response = client.chat.complete(
-        model=MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Extract only the manufacturer or maker names from the "
-                    "following RFQ text. Return a plain list separated by "
-                    "hyphens. Do not add explanations.\n\n"
-                    f"RFQ text:\n{cleaned}"
-                ),
-            }
-        ],
-        temperature=0,
-    )
-
-    return get_message_content(response)
-
-
-def manufacture_name(text) -> str:
-    cleaned = _clean(text)
-
-    if not cleaned:
-        return ""
-
-    try:
-        return _manu_uncached(cleaned)
-    except Exception as exc:
-        show_api_error("Manufacturer-name request failed", exc)
-        return ""
 
 
 # ============================================================
@@ -645,7 +744,6 @@ with col1:
                 }
 
                 matching_sheet = None
-
                 for sheet_name in excel_file.sheet_names:
                     header = pd.read_excel(
                         excel_file,
@@ -720,7 +818,6 @@ with col1:
                     upload_sheet[f"G{target_row}"] = record["Quantity"]
                     upload_sheet[f"F{target_row}"] = record["InternalNote"]
                     upload_sheet[f"I{target_row}"] = record.get("Number", "")
-
                     line_item += 10
                     target_row += 1
 
@@ -744,12 +841,15 @@ with col1:
 
                     po_text = record["InternalNote"]
 
+                    # ONE Mistral call returns both values.
+                    formatted_text, manufacturer = process_rfq_text(po_text)
+
                     final_sheet[f"A{target_row}"] = line_item
                     final_sheet[f"B{target_row}"] = record["Description"]
                     final_sheet[f"C{target_row}"] = record["Quantity"]
                     final_sheet[f"D{target_row}"] = record["Unit of Measure"]
-                    final_sheet[f"E{target_row}"] = format_text(po_text)
-                    final_sheet[f"G{target_row}"] = manufacture_name(po_text)
+                    final_sheet[f"E{target_row}"] = formatted_text
+                    final_sheet[f"G{target_row}"] = manufacturer
 
                     line_item += 10
                     target_row += 1
@@ -868,6 +968,7 @@ with col2:
                     "",
                     full_pdf_text,
                 )
+
                 data = parse_pdf(clean_body, full_pdf_text)
 
                 if not data:
@@ -918,16 +1019,17 @@ with col2:
                         f"Processing item {processed_count} of {total_items}"
                     )
 
+                    # ONE Mistral call returns both values.
+                    formatted_text, manufacturer = process_rfq_text(
+                        record["PO Text"]
+                    )
+
                     final_sheet[f"A{target_row}"] = record["RFx Item No"]
                     final_sheet[f"B{target_row}"] = record["Description"]
                     final_sheet[f"C{target_row}"] = record["QTY"]
                     final_sheet[f"D{target_row}"] = record["UOM"]
-                    final_sheet[f"E{target_row}"] = format_text(
-                        record["PO Text"]
-                    )
-                    final_sheet[f"G{target_row}"] = manufacture_name(
-                        record["PO Text"]
-                    )
+                    final_sheet[f"E{target_row}"] = formatted_text
+                    final_sheet[f"G{target_row}"] = manufacturer
 
                     target_row += 1
                     progress.progress(processed_count / total_items)
@@ -1006,7 +1108,6 @@ with col3:
             try:
                 source_workbook = load_workbook(hts_upload)
                 source_sheet = source_workbook.active
-
                 final_workbook = load_workbook(clean_final_template)
                 final_sheet = final_workbook.active
                 clear_template_rows(final_sheet)
@@ -1045,8 +1146,11 @@ with col3:
 
                     po_text = source_row[5].value or ""
 
-                    final_sheet[f"E{target_row}"] = format_text(po_text)
-                    final_sheet[f"G{target_row}"] = manufacture_name(po_text)
+                    # ONE Mistral call returns both values.
+                    formatted_text, manufacturer = process_rfq_text(po_text)
+
+                    final_sheet[f"E{target_row}"] = formatted_text
+                    final_sheet[f"G{target_row}"] = manufacturer
 
                     target_row += 1
                     progress.progress(processed_count / total_rows)
@@ -1090,6 +1194,7 @@ with col3:
         else:
             try:
                 dataframe = pd.read_excel(final_xlsx)
+
                 output = defaultdict(
                     lambda: {
                         "items": [],
