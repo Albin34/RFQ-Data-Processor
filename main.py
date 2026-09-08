@@ -82,14 +82,14 @@ def api_key_is_configured() -> bool:
     return bool(
         API_KEY
         and API_KEY.strip()
-        and API_KEY != "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT"
+        and API_KEY != "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
     )
 
 
 if not api_key_is_configured():
     st.error(
         "Mistral API key is not configured. Open main.py in GitHub and replace "
-        'API_KEY = "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT" with your valid key.'
+        'API_KEY = "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE" with your valid key.'
     )
     st.stop()
 
