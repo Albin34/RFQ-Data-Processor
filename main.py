@@ -60,7 +60,7 @@ st.markdown(
 # ============================================================
 # Since you said you can only change GitHub code, paste the new key here.
 # IMPORTANT: A key committed to a public repository is visible to everyone.
-API_KEY = "PMFVLvTCzWBM5E2zZam3PGxwVuUfy3K9"
+API_KEY = "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT"
 
 MODEL = "mistral-medium-3-5"
 
@@ -82,14 +82,14 @@ def api_key_is_configured() -> bool:
     return bool(
         API_KEY
         and API_KEY.strip()
-        and API_KEY != "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
+        and API_KEY != "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT"
     )
 
 
 if not api_key_is_configured():
     st.error(
         "Mistral API key is not configured. Open main.py in GitHub and replace "
-        'API_KEY = "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE" with your valid key.'
+        'API_KEY = "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT" with your valid key.'
     )
     st.stop()
 
