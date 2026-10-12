@@ -79,6 +79,15 @@ def _clean(value):
         pass
     return str(value).strip()
 
+def normalize_qty(value):
+    """Remove thousands-group separators without changing nonnumeric quantities."""
+    if isinstance(value, str):
+        raw = value.strip()
+        if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", raw):
+            return raw.replace(",", "")
+        return value
+    return value
+
 def workbook_bytes(workbook):
     buffer = BytesIO()
     workbook.save(buffer)
@@ -267,6 +276,10 @@ def process_to_final(records, template, suffix, session_prefix, upload_wb=None):
     sheet["E1"] = "Internal Note"
     sheet.delete_cols(8, 1)  # H = mail id
     sheet.delete_cols(6, 1)  # F = Subject line
+    # Output must contain only the first (formatted) working sheet.
+    for extra_sheet in list(wb.worksheets):
+        if extra_sheet is not sheet:
+            wb.remove(extra_sheet)
     wrap_all(sheet)
     st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
     if upload_wb is not None:
@@ -350,7 +363,7 @@ with col1:
                     line = (i+1)*10
                     row = i+2
                     values = {"A":rfq_number, "B":line, "E":rec["Description"],
-                              "F":rec["InternalNote"], "G":rec["Quantity"],
+                              "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
                               "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
                     for c, value in values.items():
                         upload_sheet[f"{c}{row}"] = value
@@ -362,8 +375,8 @@ with col1:
                 show_error("Excel processing failed (no incomplete files were saved)", exc)
     if "excel_upload_bytes" in st.session_state:
         s = st.session_state["excel_suffix"]
-        download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"upload file - {s}.xlsx", "dl_excel_up")
-        download_xlsx("Download FINAL SHEET", st.session_state["excel_final_bytes"], f"FINAL SHEET - {s}.xlsx", "dl_excel_fin")
+        download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_excel_up")
+        download_xlsx("Download FINAL SHEET", st.session_state["excel_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_excel_fin")
 
 with col2:
     st.subheader("PDF Data Processor")
@@ -392,7 +405,7 @@ with col2:
                            ("QTY", "G"), ("UOM", "H")]
                 for i, item in enumerate(data, start=2):
                     for field, col in mapping:
-                        sheet[f"{col}{i}"] = item[field]
+                        sheet[f"{col}{i}"] = normalize_qty(item[field]) if field == "QTY" else item[field]
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
                 process_to_final(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb)
@@ -401,8 +414,8 @@ with col2:
                 show_error("PDF processing failed (no incomplete files were saved)", exc)
     if "pdf_upload_bytes" in st.session_state:
         s = st.session_state["pdf_suffix"]
-        download_xlsx("Download Upload file", st.session_state["pdf_upload_bytes"], f"upload file - {s}.xlsx", "dl_pdf_up")
-        download_xlsx("Download FINAL SHEET", st.session_state["pdf_final_bytes"], f"FINAL SHEET - {s}.xlsx", "dl_pdf_fin")
+        download_xlsx("Download Upload file", st.session_state["pdf_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_pdf_up")
+        download_xlsx("Download FINAL SHEET", st.session_state["pdf_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_pdf_fin")
 
 with col3:
     st.subheader("HTS Cleaner")
@@ -428,7 +441,7 @@ with col3:
             except Exception as exc:
                 show_error("HTS cleaning failed (no incomplete files were saved)", exc)
     if "clean_final_bytes" in st.session_state:
-        download_xlsx("Download cleaned FINAL SHEET", st.session_state["clean_final_bytes"], "FINAL SHEET - cleaned.xlsx", "dl_clean")
+        download_xlsx("Download cleaned FINAL SHEET", st.session_state["clean_final_bytes"], "Working Sheet_cleaned.xlsx", "dl_clean")
 
     st.subheader("List Maker")
     final_file = st.file_uploader("FINAL SHEET for manufacturers", type=["xlsx"], key="manuf")
