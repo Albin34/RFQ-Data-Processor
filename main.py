@@ -1,4 +1,8 @@
-# main.py
+"""RFQ Data Processor - Groq edition.
+
+Requires GROQ_API_KEY in Streamlit secrets or environment variables.
+Preserves the repository's Excel/PDF/HTS/List Maker workflows.
+"""
 import functools
 import json
 import math
@@ -14,1265 +18,393 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from PyPDF2 import PdfReader
-from mistralai.client import Mistral
+from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from PyPDF2 import PdfReader
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-# ============================================================
-# Streamlit page setup
-# ============================================================
-st.set_page_config(
-    page_title="RFQ Data Processor",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
+st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""<style>
+.stButton button {background:#ff914d;color:white;border-radius:8px;padding:10px 16px;margin-top:10px}
+.stExpander {border-radius:10px}
+</style>""", unsafe_allow_html=True)
 if "show_diagnostics" not in st.session_state:
     st.session_state.show_diagnostics = False
 
-st.markdown(
-    """
-    <style>
-    .stButton button {
-        background: #ff914d;
-        color: #fff;
-        border-radius: 8px;
-        padding: 10px 16px;
-        margin-top: 10px;
-    }
-    .stExpander {
-        background: #333;
-        border-radius: 10px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ============================================================
-# API configuration
-# ============================================================
-# Keep your existing hard-coded Mistral API key here for now.
-# Replace the placeholder below with the same API key currently in your app.
-API_KEY = "x55HpGr7BQ4PBJTDAgikb2QM5VwdhQpT"
-
-MODEL = "mistral-medium-3-5"
-
-# The current organization limit shown for the Medium model is 1 request/sec.
-# 1.20 seconds gives a safety margin and keeps the app below that burst rate.
-MISTRAL_MIN_INTERVAL_SECONDS = 1.20
-
-# Formatting instructions are stored in prompt.txt in the same GitHub folder.
+# Configuration (never commit an API key to GitHub).
+try:
+    API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+    MODEL = st.secrets.get("GROQ_MODEL", os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"))
+except Exception:
+    API_KEY = os.environ.get("GROQ_API_KEY", "")
+    MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+MIN_INTERVAL_SECONDS = 3.0
 PROMPT_PATH = Path(__file__).with_name("prompt.txt")
-
 try:
     FORMAT_PROMPT = PROMPT_PATH.read_text(encoding="utf-8").strip()
 except OSError as exc:
     st.error(f"Unable to load prompt.txt: {exc}")
     st.stop()
-
 if not FORMAT_PROMPT:
-    st.error("prompt.txt is empty. Add the RFQ formatting instructions.")
+    st.error("prompt.txt is empty.")
+    st.stop()
+if not API_KEY.strip():
+    st.error("Missing GROQ_API_KEY. Add it in Streamlit Cloud app settings > Secrets.")
     st.stop()
 
+client = OpenAI(api_key=API_KEY.strip(), base_url="https://api.groq.com/openai/v1", timeout=90, max_retries=0)
 
-def api_key_is_configured() -> bool:
-    return bool(
-        API_KEY
-        and API_KEY.strip()
-        and API_KEY != "PASTE_YOUR_EXISTING_MISTRAL_API_KEY_HERE"
-        and API_KEY != "PASTE_YOUR_NEW_MISTRAL_API_KEY_HERE"
-    )
-
-
-if not api_key_is_configured():
-    st.error(
-        "Mistral API key is not configured. Open main.py and put your existing "
-        "API key in the API_KEY variable."
-    )
-    st.stop()
-
-client = Mistral(api_key=API_KEY.strip())
-
-
-# ============================================================
-# Application-wide Mistral rate limiter
-# ============================================================
 @st.cache_resource
-def get_mistral_rate_limiter():
-    """
-    Shared across Streamlit sessions in this app process.
+def rate_limiter():
+    return {"lock": threading.Lock(), "last": 0.0}
 
-    The lock serializes Mistral calls and last_request_started stores the
-    monotonic timestamp at which the previous API request began.
-    """
-    return {
-        "lock": threading.Lock(),
-        "last_request_started": 0.0,
-    }
-
-
-MISTRAL_RATE_LIMITER = get_mistral_rate_limiter()
-
+LIMITER = rate_limiter()
 
 def throttled_chat_complete(**kwargs):
-    """
-    Execute client.chat.complete while enforcing a minimum interval between
-    the start of any two Mistral API calls across the application.
-    """
-    with MISTRAL_RATE_LIMITER["lock"]:
-        now = time.monotonic()
-        elapsed = now - MISTRAL_RATE_LIMITER["last_request_started"]
-        remaining = MISTRAL_MIN_INTERVAL_SECONDS - elapsed
+    # Serializes calls across app sessions and spaces request start times.
+    with LIMITER["lock"]:
+        wait = MIN_INTERVAL_SECONDS - (time.monotonic() - LIMITER["last"])
+        if wait > 0:
+            time.sleep(wait)
+        LIMITER["last"] = time.monotonic()
+        return client.chat.completions.create(**kwargs)
 
-        if remaining > 0:
-            time.sleep(remaining)
-
-        # Record immediately before the request starts. This controls request
-        # start rate rather than adding an unnecessary full delay after slow
-        # API responses.
-        MISTRAL_RATE_LIMITER["last_request_started"] = time.monotonic()
-        return client.chat.complete(**kwargs)
-
-
-# ============================================================
-# General helpers
-# ============================================================
-def _clean(value) -> str:
+def _clean(value):
     if value is None:
         return ""
-
-    if isinstance(value, float) and math.isnan(value):
-        return ""
-
+    try:
+        if pd.isna(value):
+            return ""
+    except (ValueError, TypeError):
+        pass
     return str(value).strip()
 
-
-def workbook_bytes(workbook) -> bytes:
+def workbook_bytes(workbook):
     buffer = BytesIO()
     workbook.save(buffer)
-    buffer.seek(0)
     return buffer.getvalue()
 
-
-def wrap_all(worksheet) -> None:
-    """
-    Enable wrapping while preserving existing template alignment settings
-    as much as possible.
-    """
+def wrap_all(worksheet):
     for row in worksheet.iter_rows():
         for cell in row:
-            alignment = copy(cell.alignment)
-            alignment.wrap_text = True
+            align = copy(cell.alignment)
+            align.wrap_text = True
+            if not align.vertical:
+                align.vertical = "top"
+            cell.alignment = align
 
-            if not alignment.vertical:
-                alignment.vertical = "top"
-
-            cell.alignment = alignment
-
-
-def clear_template_rows(worksheet, start_row: int = 2) -> None:
-    """
-    Clear values only. Existing styles and template formatting remain.
-    """
-    for row in worksheet.iter_rows(
-        min_row=start_row,
-        max_row=worksheet.max_row,
-    ):
+def clear_template_rows(worksheet, start_row=2):
+    for row in worksheet.iter_rows(min_row=start_row, max_row=worksheet.max_row):
         for cell in row:
             cell.value = None
 
+def show_error(title, exc):
+    st.error(f"{title}: {type(exc).__name__}: {exc}")
+    with st.expander("Error details"):
+        st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), language="text")
 
-def extract_exception_details(exc: Exception) -> str:
-    """
-    Extract as much useful information as possible from Mistral SDK,
-    Tenacity, HTTP, and nested exceptions.
-    """
-    lines = [
-        f"Exception type: {type(exc).__name__}",
-        f"Exception message: {exc!s}",
-        f"Exception repr: {exc!r}",
-    ]
+def message_content(response):
+    if not response.choices or response.choices[0].message.content is None:
+        raise ValueError("Groq returned an empty response")
+    return response.choices[0].message.content.strip()
 
-    useful_attributes = (
-        "status_code",
-        "status",
-        "code",
-        "message",
-        "body",
-        "response",
-        "request_id",
-        "headers",
-    )
-
-    for attribute in useful_attributes:
-        try:
-            value = getattr(exc, attribute, None)
-        except Exception:
-            value = None
-
-        if value not in (None, "", {}, []):
-            lines.append(f"{attribute}: {value!r}")
-
-    cause = getattr(exc, "__cause__", None)
-    context = getattr(exc, "__context__", None)
-
-    if cause is not None and cause is not exc:
-        lines.extend(
-            [
-                "",
-                f"Caused by: {type(cause).__name__}",
-                f"Cause message: {cause!s}",
-                f"Cause repr: {cause!r}",
-            ]
-        )
-
-        for attribute in useful_attributes:
-            try:
-                value = getattr(cause, attribute, None)
-            except Exception:
-                value = None
-
-            if value not in (None, "", {}, []):
-                lines.append(f"Cause {attribute}: {value!r}")
-
-    if context is not None and context is not exc and context is not cause:
-        lines.extend(
-            [
-                "",
-                f"Context: {type(context).__name__}",
-                f"Context message: {context!s}",
-                f"Context repr: {context!r}",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "Traceback:",
-            "".join(
-                traceback.format_exception(
-                    type(exc),
-                    exc,
-                    exc.__traceback__,
-                )
-            ),
-        ]
-    )
-
-    return "\n".join(lines)
-
-
-def show_api_error(title: str, exc: Exception) -> None:
-    st.error(f"{title}: {type(exc).__name__}: {exc!s}")
-    with st.expander(f"Detailed diagnostic: {title}", expanded=True):
-        st.code(extract_exception_details(exc), language="text")
-
-
-def get_message_content(response) -> str:
-    try:
-        content = response.choices[0].message.content
-    except Exception as exc:
-        raise ValueError(
-            f"Unexpected Mistral response structure: {response!r}"
-        ) from exc
-
-    if content is None:
-        raise ValueError("Mistral returned an empty message.")
-
-    if isinstance(content, str):
-        return content.strip()
-
-    return str(content).strip()
-
-
-def _strip_code_fence(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def _parse_combined_response(raw_response: str, original_text: str) -> tuple[str, str]:
-    """
-    Parse the single Mistral response containing both formatted RFQ text and
-    manufacturer names.
-
-    Expected response:
-    {
-      "formatted_text": "...",
-      "manufacturer": "Maker A - Maker B"
-    }
-    """
-    cleaned_response = _strip_code_fence(raw_response)
-
-    # If Mistral adds a short sentence around the JSON, isolate the object.
-    first_brace = cleaned_response.find("{")
-    last_brace = cleaned_response.rfind("}")
-
-    if first_brace < 0 or last_brace <= first_brace:
-        raise ValueError(
-            "Mistral did not return the expected JSON object. "
-            f"Raw response: {cleaned_response[:1000]}"
-        )
-
-    json_text = cleaned_response[first_brace : last_brace + 1]
-
-    try:
-        payload = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Could not parse Mistral combined response as JSON. "
-            f"Raw response: {cleaned_response[:1000]}"
-        ) from exc
-
-    formatted_text = _clean(payload.get("formatted_text", ""))
-    manufacturer = payload.get("manufacturer", "")
-
-    if isinstance(manufacturer, list):
-        manufacturer = " - ".join(
-            _clean(item) for item in manufacturer if _clean(item)
-        )
-    else:
-        manufacturer = _clean(manufacturer)
-
-    # Preserve previous behavior if the model somehow returns an empty
-    # formatted_text field.
-    if not formatted_text:
-        formatted_text = original_text
-
-    formatted_text = re.sub(r"`+", "", formatted_text).strip()
-    manufacturer = re.sub(r"`+", "", manufacturer).strip()
-
-    return formatted_text, manufacturer
-
-
-# ============================================================
-# Mistral combined RFQ processing
-# ============================================================
 COMBINED_OUTPUT_INSTRUCTIONS = """
-In addition to the RFQ formatting instructions above, perform one more task:
-extract the manufacturer or maker name(s) from the same RFQ text.
-
-Return ONLY a valid JSON object using exactly these keys:
-{
-  "formatted_text": "the fully formatted RFQ text",
-  "manufacturer": "manufacturer names separated by hyphens"
-}
-
-Rules for the manufacturer field:
-- Extract only manufacturer or maker names explicitly present in the RFQ text.
-- If multiple manufacturers/makers are present, separate them with:  -  
-- Do not add explanations, labels, part numbers, model numbers, countries, or
-  other commentary to the manufacturer field.
-- If no manufacturer or maker is stated, return an empty string.
-
-Rules for formatted_text:
-- Follow all formatting instructions from the main system prompt.
-- Do not omit technical information from the RFQ text.
-- Do not put Markdown code fences around the JSON.
+Additionally extract the explicitly named manufacturer(s) from the same RFQ text.
+Return ONLY a JSON object with EXACTLY these two keys:
+{"formatted_text":"fully formatted RFQ text","manufacturer":"Maker A - Maker B"}
+For manufacturer: only copy manufacturer/maker names explicitly stated in source;
+separate multiple names with ' - '; return empty string if none are given.
+Do not add part numbers, places, explanations or guessed names.
+For formatted_text: follow the formatting prompt, keep all technical details,
+and never invent any attributes. Do not add Markdown fences.
 """.strip()
 
-
+# Retry only transient failures, not invalid credentials, missing models or bad JSON.
 @functools.lru_cache(maxsize=1024)
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    stop=stop_after_attempt(3),
-    retry=retry_if_exception_type(Exception),
-    reraise=True,
-)
-def _process_rfq_uncached(text: str) -> tuple[str, str]:
-    """
-    ONE Mistral request for one RFQ item.
-
-    Returns:
-        (formatted_text, manufacturer)
-    """
+@retry(wait=wait_exponential(multiplier=2, min=2, max=20), stop=stop_after_attempt(3),
+       retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)), reraise=True)
+def process_rfq_text(text):
     cleaned = _clean(text)
-
     if not cleaned:
         return "", ""
-
     response = throttled_chat_complete(
         model=MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    FORMAT_PROMPT
-                    + "\n\n"
-                    + COMBINED_OUTPUT_INSTRUCTIONS
-                ),
-            },
-            {
-                "role": "user",
-                "content": cleaned,
-            },
+            {"role":"system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS},
+            {"role":"user", "content": cleaned},
         ],
         temperature=0,
+        response_format={"type":"json_object"},
     )
-
-    raw_result = get_message_content(response)
-
-    if not raw_result:
-        raise ValueError("Mistral returned an empty RFQ-processing response.")
-
-    return _parse_combined_response(raw_result, cleaned)
-
-
-def process_rfq_text(text) -> tuple[str, str]:
-    """
-    Safe public wrapper used by all three processors.
-
-    On API failure, the original RFQ text is kept and manufacturer is blank,
-    so workbook creation can continue.
-    """
-    cleaned = _clean(text)
-
-    if not cleaned:
-        return "", ""
-
+    raw = message_content(response)
     try:
-        return _process_rfq_uncached(cleaned)
-    except Exception as exc:
-        show_api_error("RFQ AI processing failed", exc)
-        return cleaned, ""
+        result = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Groq returned invalid JSON: {raw[:300]}") from exc
+    if not isinstance(result, dict):
+        raise ValueError("Groq response must be a JSON object")
+    formatted = result.get("formatted_text")
+    manufacturer = result.get("manufacturer", "")
+    if not isinstance(formatted, str) or not formatted.strip():
+        raise ValueError("Groq returned no formatted_text; item not silently accepted")
+    if isinstance(manufacturer, list):
+        manufacturer = " - ".join(_clean(s) for s in manufacturer if _clean(s))
+    if not isinstance(manufacturer, str):
+        raise ValueError("Groq returned an invalid manufacturer field")
+    return formatted.strip().replace("`", ""), manufacturer.strip().replace("`", "")
 
-
-# Compatibility wrappers. New processing loops below call process_rfq_text()
-# once and unpack both values, but these are kept in case another part of the
-# project imports the old function names.
-def format_text(text) -> str:
+# Compatibility with old callers.
+def format_text(text):
     return process_rfq_text(text)[0]
 
-
-def manufacture_name(text) -> str:
+def manufacture_name(text):
     return process_rfq_text(text)[1]
 
-
-# ============================================================
-# Mistral diagnostics
-# ============================================================
-# The diagnostics sidebar is fully hidden unless the user clicks the button.
-# CSS is used because Streamlit may restore a previously opened sidebar state.
+# Diagnostics
 if st.session_state.show_diagnostics:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] {
-            display: block !important;
-        }
-        [data-testid="stSidebarCollapsedControl"] {
-            display: none !important;
-        }
-        [data-testid="collapsedControl"] {
-            display: none !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
     with st.sidebar:
-        st.header("API Diagnostics")
-
-        if st.button(
-            "Close Diagnostics",
-            key="close_diagnostics",
-            use_container_width=True,
-        ):
+        st.header("Groq API Diagnostics")
+        if st.button("Close Diagnostics", use_container_width=True):
             st.session_state.show_diagnostics = False
             st.rerun()
-
-        st.caption(
-            "All diagnostic requests use the same application-wide "
-            f"{MISTRAL_MIN_INTERVAL_SECONDS:.2f}-second Mistral throttle."
-        )
-
-        masked_key = (
-            f"{API_KEY[:4]}...{API_KEY[-4:]}"
-            if len(API_KEY) >= 10
-            else "Configured"
-        )
-        st.write(f"API key: `{masked_key}`")
-        st.write(f"Formatting model: `{MODEL}`")
-        st.write(
-            "Minimum interval: "
-            f"`{MISTRAL_MIN_INTERVAL_SECONDS:.2f} seconds/request`"
-        )
-
-        if st.button(
-            "1. Test standard chat API",
-            key="test_chat_api",
-            use_container_width=True,
-        ):
+        st.write(f"Provider: Groq Cloud")
+        st.write(f"Model: `{MODEL}`")
+        st.write(f"Key: `{API_KEY[:4]}...{API_KEY[-4:]}`")
+        st.caption(f"Minimum request spacing: {MIN_INTERVAL_SECONDS} seconds (free-tier limits still apply)")
+        if st.button("1. Test standard chat API", use_container_width=True):
             try:
-                response = throttled_chat_complete(
-                    model=MODEL,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": "Reply with exactly: CHAT API OK",
-                        }
-                    ],
-                    temperature=0,
-                )
-                st.success(get_message_content(response))
+                reply = throttled_chat_complete(model=MODEL, messages=[{"role":"user", "content":"Reply with exactly: CHAT API OK"}], temperature=0)
+                st.success(message_content(reply))
             except Exception as exc:
-                show_api_error("Standard chat API test failed", exc)
-
-        if st.button(
-            "2. Test combined RFQ processing",
-            key="test_format_api",
-            use_container_width=True,
-        ):
+                show_error("Chat API test failed", exc)
+        if st.button("2. Test combined RFQ processing", use_container_width=True):
             try:
-                sample_text = (
-                    "Basic Data Text:\n"
-                    "VALVE, SOLENOID\n"
-                    "PRESSURE RATING: 320 BAR\n"
-                    "MANUFACTURER: DANA CORPORATION"
-                )
-                formatted, manufacturer = _process_rfq_uncached(sample_text)
-                st.success("Combined RFQ processing test succeeded.")
-                st.write("Formatted text:")
+                sample = "Basic Data Text:\nVALVE, SOLENOID\nPRESSURE RATING: 320 BAR\nMANUFACTURER: DANA CORPORATION"
+                formatted, manufacturer = process_rfq_text(sample)
+                st.success("Combined RFQ test succeeded")
                 st.code(formatted, language="text")
-                st.write(f"Manufacturer: `{manufacturer}`")
+                st.write("Manufacturer:", manufacturer)
             except Exception as exc:
-                show_api_error("Combined RFQ processing test failed", exc)
-
-        st.info(
-            "Interpretation:\n\n"
-            "- Both tests succeed: the API, throttle, model and combined "
-            "processing are working.\n"
-            "- Both tests fail: check the API key, billing, quota or model "
-            "access.\n"
-            "- Chat succeeds but combined processing fails: review prompt.txt "
-            "or the returned JSON/diagnostic error."
-        )
-
+                show_error("RFQ processing test failed", exc)
 else:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] {
-            display: none !important;
-        }
-        [data-testid="stSidebarCollapsedControl"] {
-            display: none !important;
-        }
-        [data-testid="collapsedControl"] {
-            display: none !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""<style>[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"],[data-testid="collapsedControl"]{display:none!important}</style>""", unsafe_allow_html=True)
 
-
-# ============================================================
-# PDF helpers
-# ============================================================
-def pdf_text(pdf_file) -> str:
+def pdf_text(pdf_file):
     reader = PdfReader(pdf_file)
-    extracted_pages = []
-
-    for page_number, page in enumerate(reader.pages, start=1):
-        try:
-            extracted_pages.append(page.extract_text() or "")
-        except Exception as exc:
-            raise ValueError(
-                f"Could not extract text from PDF page {page_number}: {exc}"
-            ) from exc
-
-    return "".join(extracted_pages)
-
-
-def pdf_clean_body(pdf_file) -> str:
-    return re.sub(
-        r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)",
-        "",
-        pdf_text(pdf_file),
-    )
-
-
-def parse_pdf(body: str, full_rfq_text: str) -> list[dict]:
-    rfx_match = re.search(r"RFQ Number (\d+)", full_rfq_text)
-    rfx_number = rfx_match.group(1) if rfx_match else "Unknown"
-
-    item_pattern = re.compile(
-        r"(\d{5}) (\w?12\d{10}) "
-        r"(\d+(?:\.\d+)?)\s*(\w+) "
-        r".*?(\d{2}\.\d{2}\.\d{4})",
-        re.DOTALL,
-    )
-
-    short_text_pattern = re.compile(
-        r"Short Text :(.*?)\n",
-        re.DOTALL,
-    )
-
-    po_text_pattern = re.compile(
-        r"PO Material Text :(.*?)Agreement / LineNo.",
-        re.DOTALL,
-    )
-
-    items = item_pattern.findall(body)
-    short_texts = short_text_pattern.findall(body)
-    po_texts = po_text_pattern.findall(body)
-
     output = []
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            output.append(page.extract_text() or "")
+        except Exception as exc:
+            raise ValueError(f"Cannot extract page {i}: {exc}") from exc
+    return "".join(output)
 
-    for index, item in enumerate(items):
-        material_number = (
-            item[1]
-            if item[1].startswith(("B12", "12", "B16", "15"))
-            else ""
-        )
+def parse_pdf(body, full_rfq_text):
+    rfq_match = re.search(r"RFQ Number (\d+)", full_rfq_text)
+    rfq_number = rfq_match.group(1) if rfq_match else "Unknown"
+    item_pattern = re.compile(r"(\d{5}) (\w?12\d{10}) (\d+(?:\.\d+)?)\s*(\w+) .*?(\d{2}\.\d{2}\.\d{4})", re.S)
+    short_pattern = re.compile(r"Short Text :(.*?)\n", re.S)
+    po_pattern = re.compile(r"PO Material Text :(.*?)Agreement / LineNo.", re.S)
+    items = item_pattern.findall(body)
+    shorts = short_pattern.findall(body)
+    pos = po_pattern.findall(body)
+    results = []
+    for i, item in enumerate(items):
+        material = item[1] if item[1].startswith(("B12", "12", "B16", "15")) else ""
+        results.append({"RFx Number":rfq_number, "RFx Item No":item[0], "PR Item No":"",
+                        "Material No":material, "Description":shorts[i] if i<len(shorts) else "",
+                        "PO Text":pos[i] if i<len(pos) else "", "QTY":item[2], "UOM":item[3]})
+    return results
 
-        output.append(
-            {
-                "RFx Number": rfx_number,
-                "RFx Item No": item[0],
-                "PR Item No": "",
-                "Material No": material_number,
-                "Description": (
-                    short_texts[index]
-                    if index < len(short_texts)
-                    else ""
-                ),
-                "PO Text": (
-                    po_texts[index]
-                    if index < len(po_texts)
-                    else ""
-                ),
-                "QTY": item[2],
-                "UOM": item[3],
-            }
-        )
+def resolve_template(uploaded, default_filename):
+    path = uploaded if uploaded is not None else Path(__file__).with_name(default_filename)
+    if isinstance(path, Path) and not path.is_file():
+        raise FileNotFoundError(f"Missing default template: {path.name}. Please upload a template.")
+    return path
 
-    return output
+def process_to_final(records, template, suffix, session_prefix, upload_wb=None):
+    """Records: (line, desc, qty, uom, source_note) tuples."""
+    wb = load_workbook(template)
+    sheet = wb.active
+    clear_template_rows(sheet)
+    count = len(records)
+    progress = st.progress(0)
+    status = st.empty()
+    for i, (line, desc, qty, uom, note) in enumerate(records, 1):
+        status.write(f"Processing item {i} of {count}")
+        formatted, manufacturer = process_rfq_text(note)
+        target = i + 1
+        for col, value in {"A":line, "B":desc, "C":qty, "D":uom, "E":formatted, "G":manufacturer}.items():
+            sheet[f"{col}{target}"] = value
+        progress.progress(i/count)
+    wrap_all(sheet)
+    st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
+    if upload_wb is not None:
+        st.session_state[f"{session_prefix}_upload_bytes"] = workbook_bytes(upload_wb)
+    st.session_state[f"{session_prefix}_suffix"] = suffix
+    status.empty()
+    progress.empty()
 
+def download_xlsx(label, data, filename, key):
+    st.download_button(label, data, file_name=filename,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
-# ============================================================
-# Main UI
-# ============================================================
-top_left, top_right = st.columns([1, 7])
-
-with top_left:
-    if st.button(
-        "API Diagnostics",
-        key="open_diagnostics",
-        use_container_width=True,
-    ):
+left, _ = st.columns([1, 7])
+with left:
+    if st.button("API Diagnostics", use_container_width=True):
         st.session_state.show_diagnostics = True
         st.rerun()
-
 col1, col2, col3 = st.columns([2, 2, 1])
 
-
-# ============================================================
-# 1. Excel Processor
-# ============================================================
 with col1:
     st.subheader("Excel Data Processor")
-
-    techno = st.file_uploader(
-        "Techno-Commercial Envelope (.xls)",
-        type=["xls"],
-        key="techno",
-    )
-
+    techno = st.file_uploader("Techno-Commercial Envelope (.xls)", type=["xls"], key="techno")
     with st.expander("Excel templates", expanded=True):
-        uploaded_upload_template = st.file_uploader(
-            "Upload template (.xlsx)",
-            type=["xlsx"],
-            key="tpl_upl",
-        )
-
-        uploaded_final_template = st.file_uploader(
-            "Final Sheet template (.xlsx)",
-            type=["xlsx"],
-            key="tpl_fin",
-        )
-
-    upload_template = (
-        uploaded_upload_template
-        if uploaded_upload_template is not None
-        else "upload file - HTS.xlsx"
-    )
-
-    final_template = (
-        uploaded_final_template
-        if uploaded_final_template is not None
-        else "FINAL SHEET.xlsx"
-    )
-
-    suffix = st.text_input(
-        "Output name suffix",
-        key="suffix_excel",
-    )
-
+        upload_tpl = st.file_uploader("Upload template (.xlsx)", type=["xlsx"], key="tpl_upl")
+        final_tpl = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="tpl_fin")
+    suffix = st.text_input("Output name suffix", key="suffix_excel")
     if st.button("Process Excel", key="btn_excel"):
-        if techno is None:
-            st.warning("Upload the Techno-Commercial Envelope.")
-        elif not suffix.strip():
-            st.warning("Enter an output name suffix.")
+        if techno is None or not suffix.strip():
+            st.warning("Upload the Techno-Commercial Envelope and enter an output suffix.")
         else:
             try:
-                filename_number = re.search(r"\d+", techno.name)
-                rfx_number = (
-                    filename_number.group()
-                    if filename_number
-                    else "Unknown"
-                )
-
-                excel_file = pd.ExcelFile(techno)
-
-                required_columns = {
-                    "Description",
-                    "InternalNote",
-                    "Quantity",
-                    "Unit of Measure",
-                }
-
-                matching_sheet = None
-                for sheet_name in excel_file.sheet_names:
-                    header = pd.read_excel(
-                        excel_file,
-                        sheet_name=sheet_name,
-                        nrows=1,
-                    )
-
-                    if required_columns.issubset(set(header.columns)):
-                        matching_sheet = sheet_name
+                rfq_match = re.search(r"\d+", techno.name)
+                rfq_number = rfq_match.group() if rfq_match else "Unknown"
+                book = pd.ExcelFile(techno)
+                required = {"Description", "InternalNote", "Quantity", "Unit of Measure"}
+                matching = None
+                for name in book.sheet_names:
+                    if required.issubset(set(pd.read_excel(book, sheet_name=name, nrows=1).columns)):
+                        matching = name
                         break
-
-                if matching_sheet is None:
-                    raise ValueError(
-                        "Required columns are missing. Expected: "
-                        + ", ".join(sorted(required_columns))
-                    )
-
-                dataframe = pd.read_excel(
-                    excel_file,
-                    sheet_name=matching_sheet,
-                    keep_default_na=False,
-                )
-
-                descriptions = (
-                    dataframe["Description"]
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                )
-
-                quantities = (
-                    dataframe["Quantity"]
-                    .astype(str)
-                    .str.strip()
-                )
-
-                units = (
-                    dataframe["Unit of Measure"]
-                    .astype(str)
-                    .str.strip()
-                )
-
-                valid = dataframe[
-                    descriptions.ne("item or lot description")
-                    & quantities.ne("")
-                    & units.ne("")
-                    & units.str.lower().ne("unit of measure")
-                ]
-
+                if matching is None:
+                    raise ValueError(f"No sheet contains the required columns: {', '.join(sorted(required))}")
+                df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
+                description = df["Description"].astype(str).str.strip().str.lower()
+                qty = df["Quantity"].astype(str).str.strip()
+                uom = df["Unit of Measure"].astype(str).str.strip()
+                valid = df[description.ne("item or lot description") & qty.ne("") & uom.ne("") & uom.str.lower().ne("unit of measure")]
                 if valid.empty:
-                    raise ValueError(
-                        "No valid RFQ line items were found in the selected sheet."
-                    )
-
-                progress = st.progress(0)
-                status = st.empty()
-                total_items = len(valid)
-
-                # Upload workbook
-                upload_workbook = load_workbook(upload_template)
-                upload_sheet = upload_workbook.active
+                    raise ValueError("No valid RFQ line items found")
+                upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+                upload_sheet = upload_wb.active
                 clear_template_rows(upload_sheet)
-
-                target_row = 2
-                line_item = 10
-
-                for _, record in valid.iterrows():
-                    upload_sheet[f"A{target_row}"] = rfx_number
-                    upload_sheet[f"B{target_row}"] = line_item
-                    upload_sheet[f"E{target_row}"] = record["Description"]
-                    upload_sheet[f"H{target_row}"] = record["Unit of Measure"]
-                    upload_sheet[f"G{target_row}"] = record["Quantity"]
-                    upload_sheet[f"F{target_row}"] = record["InternalNote"]
-                    upload_sheet[f"I{target_row}"] = record.get("Number", "")
-                    line_item += 10
-                    target_row += 1
-
+                records = []
+                for i, (_, rec) in enumerate(valid.iterrows()):
+                    line = (i+1)*10
+                    row = i+2
+                    values = {"A":rfq_number, "B":line, "E":rec["Description"],
+                              "F":rec["InternalNote"], "G":rec["Quantity"],
+                              "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
+                    for c, value in values.items():
+                        upload_sheet[f"{c}{row}"] = value
+                    records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
                 wrap_all(upload_sheet)
-
-                # Final Sheet workbook
-                final_workbook = load_workbook(final_template)
-                final_sheet = final_workbook.active
-                clear_template_rows(final_sheet)
-
-                target_row = 2
-                line_item = 10
-
-                for processed_count, (_, record) in enumerate(
-                    valid.iterrows(),
-                    start=1,
-                ):
-                    status.write(
-                        f"Processing item {processed_count} of {total_items}"
-                    )
-
-                    po_text = record["InternalNote"]
-
-                    # ONE Mistral call returns both values.
-                    formatted_text, manufacturer = process_rfq_text(po_text)
-
-                    final_sheet[f"A{target_row}"] = line_item
-                    final_sheet[f"B{target_row}"] = record["Description"]
-                    final_sheet[f"C{target_row}"] = record["Quantity"]
-                    final_sheet[f"D{target_row}"] = record["Unit of Measure"]
-                    final_sheet[f"E{target_row}"] = formatted_text
-                    final_sheet[f"G{target_row}"] = manufacturer
-
-                    line_item += 10
-                    target_row += 1
-                    progress.progress(processed_count / total_items)
-
-                wrap_all(final_sheet)
-
-                st.session_state["excel_upload_bytes"] = workbook_bytes(
-                    upload_workbook
-                )
-                st.session_state["excel_final_bytes"] = workbook_bytes(
-                    final_workbook
-                )
-                st.session_state["excel_suffix"] = suffix.strip()
-
-                status.empty()
-                progress.empty()
-                st.success("Excel processed.")
-
+                process_to_final(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb)
+                st.success("Excel processed")
             except Exception as exc:
-                show_api_error("Excel processing failed", exc)
-
+                show_error("Excel processing failed (no incomplete files were saved)", exc)
     if "excel_upload_bytes" in st.session_state:
-        saved_suffix = st.session_state["excel_suffix"]
+        s = st.session_state["excel_suffix"]
+        download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"upload file - {s}.xlsx", "dl_excel_up")
+        download_xlsx("Download FINAL SHEET", st.session_state["excel_final_bytes"], f"FINAL SHEET - {s}.xlsx", "dl_excel_fin")
 
-        st.download_button(
-            "Download Upload file",
-            st.session_state["excel_upload_bytes"],
-            file_name=f"upload file - {saved_suffix}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_excel_up",
-        )
-
-        st.download_button(
-            "Download FINAL SHEET",
-            st.session_state["excel_final_bytes"],
-            file_name=f"FINAL SHEET - {saved_suffix}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_excel_fin",
-        )
-
-
-# ============================================================
-# 2. PDF Processor
-# ============================================================
 with col2:
     st.subheader("PDF Data Processor")
-
-    pdf = st.file_uploader(
-        "RFQ PDF",
-        type=["pdf"],
-        key="pdf",
-    )
-
+    pdf = st.file_uploader("RFQ PDF", type=["pdf"], key="pdf")
     with st.expander("Excel templates", expanded=True):
-        uploaded_raw_template = st.file_uploader(
-            "Raw template",
-            type=["xlsx"],
-            key="tpl_raw",
-        )
-
-        uploaded_hts_template = st.file_uploader(
-            "HTS template",
-            type=["xlsx"],
-            key="tpl_hts",
-        )
-
-        uploaded_pdf_final_template = st.file_uploader(
-            "Final Sheet template",
-            type=["xlsx"],
-            key="tpl_final_pdf",
-        )
-
-    raw_template = (
-        uploaded_raw_template
-        if uploaded_raw_template is not None
-        else "raw_template.xlsx"
-    )
-
-    hts_template = (
-        uploaded_hts_template
-        if uploaded_hts_template is not None
-        else "upload file - HTS.xlsx"
-    )
-
-    pdf_final_template = (
-        uploaded_pdf_final_template
-        if uploaded_pdf_final_template is not None
-        else "FINAL SHEET.xlsx"
-    )
-
-    # Kept for compatibility with the original interface.
-    _ = raw_template
-
-    hts_number = st.text_input(
-        "HTS number",
-        key="hts_no",
-    )
-
+        raw_tpl = st.file_uploader("Raw template", type=["xlsx"], key="tpl_raw")
+        hts_tpl = st.file_uploader("HTS template", type=["xlsx"], key="tpl_hts")
+        pdf_final_tpl = st.file_uploader("Final Sheet template", type=["xlsx"], key="tpl_final_pdf")
+    hts_number = st.text_input("HTS number", key="hts_no")
     if st.button("Process PDF", key="btn_pdf"):
-        if pdf is None:
-            st.warning("Upload an RFQ PDF.")
-        elif not hts_number.strip():
-            st.warning("Enter the HTS number.")
+        if pdf is None or not hts_number.strip():
+            st.warning("Upload an RFQ PDF and enter HTS number")
         else:
             try:
-                full_pdf_text = pdf_text(pdf)
-                clean_body = re.sub(
-                    r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)",
-                    "",
-                    full_pdf_text,
-                )
-
-                data = parse_pdf(clean_body, full_pdf_text)
-
+                full = pdf_text(pdf)
+                body = re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)", "", full)
+                data = parse_pdf(body, full)
                 if not data:
-                    raise ValueError(
-                        "No RFQ items were parsed from the PDF. "
-                        "The PDF format may not match the current parser."
-                    )
-
-                progress = st.progress(0)
-                status = st.empty()
-                total_items = len(data)
-
-                # Upload workbook
-                upload_workbook = load_workbook(hts_template)
-                upload_sheet = upload_workbook.active
-                clear_template_rows(upload_sheet)
-
-                target_row = 2
-
-                for record in data:
-                    mapping = [
-                        ("RFx Number", "A"),
-                        ("RFx Item No", "B"),
-                        ("PR Item No", "C"),
-                        ("Material No", "D"),
-                        ("Description", "E"),
-                        ("PO Text", "F"),
-                        ("QTY", "G"),
-                        ("UOM", "H"),
-                    ]
-
-                    for field, column in mapping:
-                        upload_sheet[f"{column}{target_row}"] = record[field]
-
-                    target_row += 1
-
-                wrap_all(upload_sheet)
-
-                # Final Sheet workbook
-                final_workbook = load_workbook(pdf_final_template)
-                final_sheet = final_workbook.active
-                clear_template_rows(final_sheet)
-
-                target_row = 2
-
-                for processed_count, record in enumerate(data, start=1):
-                    status.write(
-                        f"Processing item {processed_count} of {total_items}"
-                    )
-
-                    # ONE Mistral call returns both values.
-                    formatted_text, manufacturer = process_rfq_text(
-                        record["PO Text"]
-                    )
-
-                    final_sheet[f"A{target_row}"] = record["RFx Item No"]
-                    final_sheet[f"B{target_row}"] = record["Description"]
-                    final_sheet[f"C{target_row}"] = record["QTY"]
-                    final_sheet[f"D{target_row}"] = record["UOM"]
-                    final_sheet[f"E{target_row}"] = formatted_text
-                    final_sheet[f"G{target_row}"] = manufacturer
-
-                    target_row += 1
-                    progress.progress(processed_count / total_items)
-
-                wrap_all(final_sheet)
-
-                st.session_state["pdf_upload_bytes"] = workbook_bytes(
-                    upload_workbook
-                )
-                st.session_state["pdf_final_bytes"] = workbook_bytes(
-                    final_workbook
-                )
-                st.session_state["pdf_hts_no"] = hts_number.strip()
-
-                status.empty()
-                progress.empty()
-                st.success("PDF processed.")
-
+                    raise ValueError("No RFQ items parsed. The PDF may not match the supported RFQ layout or may be scanned.")
+                upload_wb = load_workbook(resolve_template(hts_tpl, "upload file - HTS.xlsx"))
+                sheet = upload_wb.active
+                clear_template_rows(sheet)
+                records = []
+                mapping = [("RFx Number", "A"), ("RFx Item No", "B"), ("PR Item No", "C"),
+                           ("Material No", "D"), ("Description", "E"), ("PO Text", "F"),
+                           ("QTY", "G"), ("UOM", "H")]
+                for i, item in enumerate(data, start=2):
+                    for field, col in mapping:
+                        sheet[f"{col}{i}"] = item[field]
+                    records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
+                wrap_all(sheet)
+                process_to_final(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb)
+                st.success("PDF processed")
             except Exception as exc:
-                show_api_error("PDF processing failed", exc)
-
+                show_error("PDF processing failed (no incomplete files were saved)", exc)
     if "pdf_upload_bytes" in st.session_state:
-        saved_hts_number = st.session_state["pdf_hts_no"]
+        s = st.session_state["pdf_suffix"]
+        download_xlsx("Download Upload file", st.session_state["pdf_upload_bytes"], f"upload file - {s}.xlsx", "dl_pdf_up")
+        download_xlsx("Download FINAL SHEET", st.session_state["pdf_final_bytes"], f"FINAL SHEET - {s}.xlsx", "dl_pdf_fin")
 
-        st.download_button(
-            "Download Upload file",
-            st.session_state["pdf_upload_bytes"],
-            file_name=f"upload file - {saved_hts_number}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_pdf_up",
-        )
-
-        st.download_button(
-            "Download FINAL SHEET",
-            st.session_state["pdf_final_bytes"],
-            file_name=f"FINAL SHEET - {saved_hts_number}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_pdf_fin",
-        )
-
-
-# ============================================================
-# 3. HTS Cleaner and List Maker
-# ============================================================
 with col3:
     st.subheader("HTS Cleaner")
-
-    hts_upload = st.file_uploader(
-        "upload file - HTS.xlsx",
-        type=["xlsx"],
-        key="hts_clean",
-    )
-
-    uploaded_clean_final_template = st.file_uploader(
-        "Final Sheet template (optional)",
-        type=["xlsx"],
-        key="tpl_clean_fin",
-    )
-
-    clean_final_template = (
-        uploaded_clean_final_template
-        if uploaded_clean_final_template is not None
-        else "FINAL SHEET.xlsx"
-    )
-
+    hts_upload = st.file_uploader("upload file - HTS.xlsx", type=["xlsx"], key="hts_clean")
+    clean_final_tpl = st.file_uploader("Final Sheet template (optional)", type=["xlsx"], key="tpl_clean_fin")
     if st.button("Clean HTS", key="btn_clean_hts"):
         if hts_upload is None:
-            st.warning("Upload the HTS workbook.")
+            st.warning("Upload the HTS workbook")
         else:
             try:
-                source_workbook = load_workbook(hts_upload)
-                source_sheet = source_workbook.active
-                final_workbook = load_workbook(clean_final_template)
-                final_sheet = final_workbook.active
-                clear_template_rows(final_sheet)
-
-                source_rows = [
-                    row
-                    for row in source_sheet.iter_rows(
-                        min_row=2,
-                        max_row=source_sheet.max_row,
-                    )
-                    if any(cell.value for cell in row)
-                ]
-
-                if not source_rows:
-                    raise ValueError(
-                        "The uploaded HTS workbook contains no data rows."
-                    )
-
-                progress = st.progress(0)
-                status = st.empty()
-                total_rows = len(source_rows)
-                target_row = 2
-
-                for processed_count, source_row in enumerate(
-                    source_rows,
-                    start=1,
-                ):
-                    status.write(
-                        f"Processing row {processed_count} of {total_rows}"
-                    )
-
-                    final_sheet[f"A{target_row}"] = source_row[1].value
-                    final_sheet[f"B{target_row}"] = source_row[4].value
-                    final_sheet[f"C{target_row}"] = source_row[6].value
-                    final_sheet[f"D{target_row}"] = source_row[7].value
-
-                    po_text = source_row[5].value or ""
-
-                    # ONE Mistral call returns both values.
-                    formatted_text, manufacturer = process_rfq_text(po_text)
-
-                    final_sheet[f"E{target_row}"] = formatted_text
-                    final_sheet[f"G{target_row}"] = manufacturer
-
-                    target_row += 1
-                    progress.progress(processed_count / total_rows)
-
-                wrap_all(final_sheet)
-
-                st.session_state["clean_bytes"] = workbook_bytes(
-                    final_workbook
-                )
-
-                status.empty()
-                progress.empty()
-                st.success("HTS cleaned.")
-
+                source = load_workbook(hts_upload).active
+                rows = [r for r in source.iter_rows(min_row=2) if any(c.value is not None for c in r)]
+                if not rows:
+                    raise ValueError("The uploaded HTS workbook contains no data rows")
+                records = []
+                for row in rows:
+                    # Existing HTS layout: B=line, E=description, F=PO text, G=qty, H=UOM.
+                    if len(row) < 8:
+                        raise ValueError("HTS workbook must have at least eight columns")
+                    records.append((row[1].value, row[4].value, row[6].value, row[7].value, row[5].value or ""))
+                process_to_final(records, resolve_template(clean_final_tpl, "FINAL SHEET.xlsx"), "cleaned", "clean")
+                st.success("HTS cleaned")
             except Exception as exc:
-                show_api_error("HTS cleaning failed", exc)
-
-    if "clean_bytes" in st.session_state:
-        st.download_button(
-            "Download cleaned FINAL SHEET",
-            st.session_state["clean_bytes"],
-            file_name="FINAL SHEET - cleaned.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_clean",
-        )
+                show_error("HTS cleaning failed (no incomplete files were saved)", exc)
+    if "clean_final_bytes" in st.session_state:
+        download_xlsx("Download cleaned FINAL SHEET", st.session_state["clean_final_bytes"], "FINAL SHEET - cleaned.xlsx", "dl_clean")
 
     st.subheader("List Maker")
-
-    final_xlsx = st.file_uploader(
-        "FINAL SHEET for manufacturers",
-        type=["xlsx"],
-        key="manuf",
-    )
-
+    final_file = st.file_uploader("FINAL SHEET for manufacturers", type=["xlsx"], key="manuf")
     if st.button("Build list", key="btn_list"):
-        if final_xlsx is None:
-            st.warning("Upload the FINAL SHEET workbook.")
+        if final_file is None:
+            st.warning("Upload the FINAL SHEET workbook")
         else:
             try:
-                dataframe = pd.read_excel(final_xlsx)
-
-                output = defaultdict(
-                    lambda: {
-                        "items": [],
-                        "emails": [],
-                    }
-                )
-
-                for _, row in dataframe.iterrows():
+                df = pd.read_excel(final_file)
+                groups = defaultdict(lambda: {"items":[], "emails":[]})
+                for _, row in df.iterrows():
                     manufacturers = _clean(row.get("Manufacturer", ""))
-
                     if not manufacturers:
                         continue
-
-                    item_number = row.get("Line item number", "")
-
-                    email_values = [
-                        row[column]
-                        for column in dataframe.columns
-                        if (
-                            "mail" in str(column).lower()
-                            or "unnamed" in str(column).lower()
-                        )
-                        and pd.notna(row[column])
-                    ]
-
-                    for manufacturer in [
-                        item.strip()
-                        for item in manufacturers.split("-")
-                        if item.strip()
-                    ]:
-                        output[manufacturer]["items"].append(item_number)
-                        output[manufacturer]["emails"].extend(email_values)
-
-                result_lines = []
-
-                for manufacturer, values in output.items():
-                    unique_items = sorted(
-                        {
-                            str(item)
-                            for item in values["items"]
-                            if _clean(item)
-                        }
-                    )
-
-                    result_lines.append(
-                        f"Item {', '.join(unique_items)}: {manufacturer}"
-                    )
-
-                    unique_emails = list(
-                        dict.fromkeys(
-                            _clean(email)
-                            for email in values["emails"]
-                            if _clean(email)
-                        )
-                    )
-
-                    if unique_emails:
-                        result_lines.extend(unique_emails)
-
-                    result_lines.append("")
-
-                final_output = "\n".join(result_lines)
-
-                st.text_area(
-                    "Output",
-                    final_output,
-                    height=300,
-                )
-
-                try:
-                    from st_copy_to_clipboard import st_copy_to_clipboard
-
-                    st_copy_to_clipboard(final_output)
-                except ImportError:
-                    st.warning(
-                        "Copy-to-clipboard component is not installed, "
-                        "but the generated list is shown above."
-                    )
-
+                    item = row.get("Line item number", "")
+                    emails = [row[col] for col in df.columns if ("mail" in str(col).lower() or "unnamed" in str(col).lower()) and pd.notna(row[col])]
+                    for name in (x.strip() for x in manufacturers.split("-") if x.strip()):
+                        groups[name]["items"].append(item)
+                        groups[name]["emails"].extend(emails)
+                lines = []
+                for manufacturer, values in groups.items():
+                    items = sorted({_clean(x) for x in values["items"] if _clean(x)})
+                    lines.append(f"Item {', '.join(items)}: {manufacturer}")
+                    lines.extend(dict.fromkeys(_clean(x) for x in values["emails"] if _clean(x)))
+                    lines.append("")
+                st.session_state["manufacturer_list"] = "\n".join(lines)
             except Exception as exc:
-                show_api_error("List creation failed", exc)
+                show_error("List creation failed", exc)
+    if "manufacturer_list" in st.session_state:
+        st.text_area("Output", st.session_state["manufacturer_list"], height=300)
+        try:
+            from st_copy_to_clipboard import st_copy_to_clipboard
+            st_copy_to_clipboard(st.session_state["manufacturer_list"])
+        except ImportError:
+            st.caption("Select the text above to copy it.")
