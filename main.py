@@ -227,6 +227,12 @@ def process_to_final(records, template, suffix, session_prefix, upload_wb=None):
         for col, value in {"A":line, "B":desc, "C":qty, "D":uom, "E":formatted, "G":manufacturer}.items():
             sheet[f"{col}{target}"] = value
         progress.progress(i/count)
+    # Customize the FINAL SHEET output (all processing modes):
+    # E: PO Text -> Internal Note; drop H: mail id and F: Subject line.
+    # Delete from right to left so G: Manufacturer moves to F correctly.
+    sheet["E1"] = "Internal Note"
+    sheet.delete_cols(8, 1)  # H = mail id
+    sheet.delete_cols(6, 1)  # F = Subject line
     wrap_all(sheet)
     st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
     if upload_wb is not None:
