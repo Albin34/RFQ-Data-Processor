@@ -151,7 +151,27 @@ def parse_groq_response(raw):
     raise ValueError("Groq response could not be parsed into formatted_text and manufacturer. Use API Diagnostics to inspect model output.")
 
 
-# Only retry network failures and rate limits. A 400 error should be shown directly.
+# Groq GPT-OSS 20B supports strict structured outputs (JSON schema).
+# This prevents ordinary completions from breaking RFQ processing due to
+# missing field names, markdown output, or unexpected response formats.
+RFQ_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rfq_formatting",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "formatted_text": {"type": "string"},
+                "manufacturer": {"type": "string"},
+            },
+            "required": ["formatted_text", "manufacturer"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# Retry transient network errors, not malformed data or invalid requests.
 @functools.lru_cache(maxsize=1024)
 @retry(wait=wait_exponential(multiplier=2, min=2, max=20), stop=stop_after_attempt(3),
        retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)), reraise=True)
@@ -159,17 +179,31 @@ def process_rfq_text(text):
     cleaned = _clean(text)
     if not cleaned:
         return "", ""
+    if MODEL != "openai/gpt-oss-20b":
+        st.warning("This version's strict structured output is tested for openai/gpt-oss-20b only. Check compatibility before changing GROQ_MODEL.")
     response = throttled_chat_complete(
         model=MODEL,
         messages=[
-            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS},
+            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS + "\nReturn only the two required fields, formatted_text and manufacturer."},
             {"role": "user", "content": cleaned},
         ],
         temperature=0,
-        # Do not set response_format=json_object: some Groq model outputs cause
-        # server-side json_validate_failed (HTTP 400) before Python sees the text.
+        response_format=RFQ_RESPONSE_FORMAT,
+        reasoning_effort="low",
+        max_completion_tokens=8192,
     )
-    formatted, manufacturer = parse_groq_response(message_content(response))
+    raw = message_content(response)
+    try:
+        formatted, manufacturer = parse_groq_response(raw)
+    except ValueError as exc:
+        choice = response.choices[0]
+        raise ValueError(
+            "Groq did not return the required fields. "
+            f"Finish reason: {choice.finish_reason}; "
+            f"response preview: {raw[:400]!r}"
+        ) from exc
+    if not formatted.strip():
+        raise ValueError("Groq returned an empty formatted_text; original RFQ text was not overwritten.")
     return formatted.replace("`", ""), manufacturer.replace("`", "")
 
 # Compatibility with old callers.
