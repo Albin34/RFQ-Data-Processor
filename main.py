@@ -23,7 +23,7 @@ from openpyxl import load_workbook
 from PyPDF2 import PdfReader
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stButton button {background:#ff914d;color:white;border-radius:8px;padding:10px 16px;margin-top:10px}
 .stExpander {border-radius:10px}
@@ -109,17 +109,49 @@ def message_content(response):
     return response.choices[0].message.content.strip()
 
 COMBINED_OUTPUT_INSTRUCTIONS = """
-Additionally extract the explicitly named manufacturer(s) from the same RFQ text.
-Return ONLY a JSON object with EXACTLY these two keys:
-{"formatted_text":"fully formatted RFQ text","manufacturer":"Maker A - Maker B"}
-For manufacturer: only copy manufacturer/maker names explicitly stated in source;
-separate multiple names with ' - '; return empty string if none are given.
-Do not add part numbers, places, explanations or guessed names.
-For formatted_text: follow the formatting prompt, keep all technical details,
-and never invent any attributes. Do not add Markdown fences.
+Extract manufacturer name(s) explicitly stated in the source text, while formatting
+all RFQ text according to the system instructions. Preserve technical details exactly.
+Do not guess manufacturers, part numbers, sizes, quantities or standards.
+Preferred reply: a single valid JSON object with keys "formatted_text" and
+"manufacturer". The formatted_text value must be a string; the manufacturer
+value must be a string (empty if no explicitly identified manufacturer).
+If JSON is difficult, instead reply as:
+<<<FORMATTED_TEXT>>>
+[complete formatted RFQ text]
+<<<MANUFACTURER>>>
+[manufacturer names separated by ' - ', or leave blank]
+No markdown fences, no commentary.
 """.strip()
 
-# Retry only transient failures, not invalid credentials, missing models or bad JSON.
+
+def parse_groq_response(raw):
+    raw = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I).strip()
+    candidates = [cleaned]
+    first, last = cleaned.find("{"), cleaned.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(cleaned[first:last + 1])
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(result, dict):
+            formatted = result.get("formatted_text", "")
+            maker = result.get("manufacturer", "")
+            if isinstance(maker, list):
+                maker = " - ".join(str(x).strip() for x in maker if str(x).strip())
+            if isinstance(formatted, str) and formatted.strip() and isinstance(maker, str):
+                return formatted.strip(), maker.strip()
+    token1, token2 = "<<<FORMATTED_TEXT>>>", "<<<MANUFACTURER>>>"
+    if token1 in cleaned and token2 in cleaned:
+        before, after = cleaned.split(token1, 1)[1].split(token2, 1)
+        if before.strip():
+            return before.strip(), after.strip().splitlines()[0].strip() if after.strip() else ""
+    raise ValueError("Groq response could not be parsed into formatted_text and manufacturer. Use API Diagnostics to inspect model output.")
+
+
+# Only retry network failures and rate limits. A 400 error should be shown directly.
 @functools.lru_cache(maxsize=1024)
 @retry(wait=wait_exponential(multiplier=2, min=2, max=20), stop=stop_after_attempt(3),
        retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)), reraise=True)
@@ -130,28 +162,15 @@ def process_rfq_text(text):
     response = throttled_chat_complete(
         model=MODEL,
         messages=[
-            {"role":"system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS},
-            {"role":"user", "content": cleaned},
+            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS},
+            {"role": "user", "content": cleaned},
         ],
         temperature=0,
-        response_format={"type":"json_object"},
+        # Do not set response_format=json_object: some Groq model outputs cause
+        # server-side json_validate_failed (HTTP 400) before Python sees the text.
     )
-    raw = message_content(response)
-    try:
-        result = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Groq returned invalid JSON: {raw[:300]}") from exc
-    if not isinstance(result, dict):
-        raise ValueError("Groq response must be a JSON object")
-    formatted = result.get("formatted_text")
-    manufacturer = result.get("manufacturer", "")
-    if not isinstance(formatted, str) or not formatted.strip():
-        raise ValueError("Groq returned no formatted_text; item not silently accepted")
-    if isinstance(manufacturer, list):
-        manufacturer = " - ".join(_clean(s) for s in manufacturer if _clean(s))
-    if not isinstance(manufacturer, str):
-        raise ValueError("Groq returned an invalid manufacturer field")
-    return formatted.strip().replace("`", ""), manufacturer.strip().replace("`", "")
+    formatted, manufacturer = parse_groq_response(message_content(response))
+    return formatted.replace("`", ""), manufacturer.replace("`", "")
 
 # Compatibility with old callers.
 def format_text(text):
@@ -159,35 +178,6 @@ def format_text(text):
 
 def manufacture_name(text):
     return process_rfq_text(text)[1]
-
-# Diagnostics
-if st.session_state.show_diagnostics:
-    with st.sidebar:
-        st.header("Groq API Diagnostics")
-        if st.button("Close Diagnostics", use_container_width=True):
-            st.session_state.show_diagnostics = False
-            st.rerun()
-        st.write(f"Provider: Groq Cloud")
-        st.write(f"Model: `{MODEL}`")
-        st.write(f"Key: `{API_KEY[:4]}...{API_KEY[-4:]}`")
-        st.caption(f"Minimum request spacing: {MIN_INTERVAL_SECONDS} seconds (free-tier limits still apply)")
-        if st.button("1. Test standard chat API", use_container_width=True):
-            try:
-                reply = throttled_chat_complete(model=MODEL, messages=[{"role":"user", "content":"Reply with exactly: CHAT API OK"}], temperature=0)
-                st.success(message_content(reply))
-            except Exception as exc:
-                show_error("Chat API test failed", exc)
-        if st.button("2. Test combined RFQ processing", use_container_width=True):
-            try:
-                sample = "Basic Data Text:\nVALVE, SOLENOID\nPRESSURE RATING: 320 BAR\nMANUFACTURER: DANA CORPORATION"
-                formatted, manufacturer = process_rfq_text(sample)
-                st.success("Combined RFQ test succeeded")
-                st.code(formatted, language="text")
-                st.write("Manufacturer:", manufacturer)
-            except Exception as exc:
-                show_error("RFQ processing test failed", exc)
-else:
-    st.markdown("""<style>[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"],[data-testid="collapsedControl"]{display:none!important}</style>""", unsafe_allow_html=True)
 
 def pdf_text(pdf_file):
     reader = PdfReader(pdf_file)
@@ -249,11 +239,37 @@ def download_xlsx(label, data, filename, key):
     st.download_button(label, data, file_name=filename,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
-left, _ = st.columns([1, 7])
-with left:
-    if st.button("API Diagnostics", use_container_width=True):
-        st.session_state.show_diagnostics = True
-        st.rerun()
+if st.button("API Diagnostics", key="toggle_diagnostics"):
+    st.session_state.show_diagnostics = not st.session_state.show_diagnostics
+if st.session_state.show_diagnostics:
+    with st.container(border=True):
+        st.subheader("Groq API Diagnostics")
+        st.caption(f"Provider: Groq Cloud | Model: {MODEL} | Key configured: {'Yes' if API_KEY else 'No'}")
+        st.caption(f"Request spacing: {MIN_INTERVAL_SECONDS} seconds; actual account rate limits also apply.")
+        test_col1, test_col2 = st.columns(2)
+        with test_col1:
+            if st.button("1. Test standard chat API", key="diag_chat"):
+                try:
+                    reply = throttled_chat_complete(
+                        model=MODEL,
+                        messages=[{"role": "user", "content": "Reply with exactly: CHAT API OK"}],
+                        temperature=0,
+                    )
+                    st.success("Chat API responded")
+                    st.code(message_content(reply), language="text")
+                except Exception as exc:
+                    show_error("Chat API test failed", exc)
+        with test_col2:
+            if st.button("2. Test RFQ processing", key="diag_rfq"):
+                try:
+                    sample = "Basic Data Text:\nVALVE, SOLENOID\nPRESSURE RATING: 320 BAR\nMANUFACTURER: DANA CORPORATION"
+                    formatted, manufacturer = process_rfq_text(sample)
+                    st.success("Combined RFQ processing succeeded")
+                    st.code(formatted, language="text")
+                    st.write("Manufacturer:", manufacturer)
+                except Exception as exc:
+                    show_error("RFQ processing test failed", exc)
+
 col1, col2, col3 = st.columns([2, 2, 1])
 
 with col1:
