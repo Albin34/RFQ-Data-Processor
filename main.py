@@ -160,6 +160,66 @@ def parse_groq_response(raw):
     raise ValueError("Groq response could not be parsed into formatted_text and manufacturer. Use API Diagnostics to inspect model output.")
 
 
+# Clarifications applied after the original prompt.txt instructions. The original
+# detailed Mistral instructions remain loaded unchanged; this contract resolves
+# contradictory examples and prevents accidental simplification of the RFQ.
+RFQ_FORMAT_CONTRACT = """
+MANDATORY RFQ TRANSCRIPTION CONTRACT (overrides conflicting examples):
+1. formatted_text is PLAIN TEXT, not Markdown and without code fences, preamble,
+   'Formatted text', or commentary. The JSON wrapper is only for the API response.
+2. Preserve ALL nonempty source facts: technical properties, unlabelled product
+   descriptions, PO material text, certificates, material codes, manufacturer
+   references, OEM identifiers, part numbers, dimensions, standards, tag numbers,
+   drawing numbers, order-specific requirements and meaningful remarks. Never
+   abbreviate, paraphrase in a way that loses details, invent, or substitute values.
+3. Section order is strictly: optional Purchase order Text / PO Material Text,
+   Basic Data Text, Classification Text, MPN Text, Inspection Text. Basic Data Text
+   is first unless a substantive purchase-order section precedes it. Never write
+   a section header with no substantive content. Do not invent missing sections.
+4. Transfer substantive PO Material Text content into Basic Data Text without
+   duplication unless the source clearly provides an actual separate purchase
+   order section that should be reproduced. PO Material Text may appear before
+   Basic Data Text as a header only when required for an actual separate section.
+5. Deduplicate *only exact repeated facts* where safe. Never remove distinct
+   manufacturer entries, separate part numbers, or slightly different values.
+   Identical duplicate manufacturer/part-number pairs may be consolidated.
+6. Omit fields whose values are empty, whitespace, '--', '---' or just a colon.
+   Keep ALL nonempty field values. Never output placeholder '-' as a value unless
+   '-' is genuinely part of a technical specification.
+7. Keep the raw source's technical spelling, capitalization, numbers and units
+   where possible. Copy MPN, OEM, manufacturer code, drawing and tag numbers
+   exactly as given. If multiple manufacturers are explicitly present, include
+   all; otherwise manufacturer is an empty string, never a guess.
+8. The mandatory JSON keys are formatted_text and manufacturer. formatted_text
+   must contain the plain text formatted RFQ. manufacturer is only the explicitly
+   stated name(s), not an explanation.
+""".strip()
+
+
+def validate_rfq_sections(formatted):
+    """Reject misordered or duplicated top-level sections; don't alter RFQ content."""
+    headings = {
+        "purchase order text": 0, "purchase order text:": 0,
+        "po material text": 0, "po material text:": 0,
+        "basic data text": 1, "basic data text:": 1,
+        "classification text": 2, "classification text:": 2,
+        "mpn text": 3, "mpn text:": 3,
+        "inspection text": 4, "inspection text:": 4,
+    }
+    found = []
+    for line in formatted.splitlines():
+        normalized = re.sub(r"\s+", " ", line.strip()).casefold()
+        if normalized in headings:
+            found.append((headings[normalized], line.strip()))
+    positions = [order for order, _ in found]
+    if positions != sorted(positions):
+        raise ValueError(f"Groq returned RFQ sections out of order: {[name for _, name in found]}")
+    if len(positions) != len(set(positions)):
+        raise ValueError(f"Groq returned duplicate RFQ section headers: {[name for _, name in found]}")
+    if not formatted.strip():
+        raise ValueError("Groq returned an empty RFQ description")
+
+
 # Groq GPT-OSS 20B supports strict structured outputs (JSON schema).
 # This prevents ordinary completions from breaking RFQ processing due to
 # missing field names, markdown output, or unexpected response formats.
@@ -193,7 +253,7 @@ def process_rfq_text(text):
     response = throttled_chat_complete(
         model=MODEL,
         messages=[
-            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS + "\nReturn only the two required fields, formatted_text and manufacturer."},
+            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + RFQ_FORMAT_CONTRACT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS + "\nReturn only the two required fields, formatted_text and manufacturer."},
             {"role": "user", "content": cleaned},
         ],
         temperature=0,
@@ -213,6 +273,7 @@ def process_rfq_text(text):
         ) from exc
     if not formatted.strip():
         raise ValueError("Groq returned an empty formatted_text; original RFQ text was not overwritten.")
+    validate_rfq_sections(formatted)
     return formatted.replace("`", ""), manufacturer.replace("`", "")
 
 # Compatibility with old callers.
