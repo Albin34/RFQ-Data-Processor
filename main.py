@@ -3,6 +3,7 @@
 Preserves the Excel/PDF/HTS/List Maker workflows without external AI APIs.
 """
 import re
+import html
 import traceback
 from collections import defaultdict
 from copy import copy
@@ -302,6 +303,68 @@ def finalize_verified(session_prefix):
     review["completed"] = True
 
 
+def _comparison_line(line):
+    """Ignore whitespace and colon spacing when comparing original and draft."""
+    return re.sub(r"\s+", "", line).casefold()
+
+
+def colored_reference(original, formatted):
+    """Selectable source text, red if a nonblank line is absent from the draft.
+
+    Presentation-only line matching, not a semantic completeness test.
+    """
+    formatted_lines = [_comparison_line(x) for x in formatted.splitlines() if x.strip()]
+    spans = []
+    for line in original.splitlines():
+        token = _comparison_line(line)
+        matched = not token or any(token == candidate or (len(token) > 16 and token in candidate)
+                                       for candidate in formatted_lines)
+        safe = html.escape(line)
+        if not matched:
+            spans.append(f'<span style="color:#ff7373;font-weight:600">{safe}</span>')
+        else:
+            spans.append(safe)
+    content = "\n".join(spans) if spans else "(No original Internal Note)"
+    st.markdown(
+        '<div style="background:#1a1d26;color:#f4f4f5;border-radius:8px;'
+        'padding:16px;max-height:460px;overflow:auto;user-select:text">'
+        '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;'
+        'font-family:monospace;font-size:13px;line-height:1.65;'
+        'margin:0;color:inherit">' + content + '</pre></div>',
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("Confirm Verify All", width="small")
+def confirm_verify_all_popup(session_prefix):
+    review = st.session_state.get(f"{session_prefix}_review")
+    if not review or review.get("completed"):
+        return
+    st.warning("Confirm to skip the verification process at your own risk")
+    st.caption("This will approve every remaining line without individual review.")
+    yes_col, no_col = st.columns(2)
+    with yes_col:
+        if st.button("Confirm", type="primary", key=f"confirm_all_{session_prefix}", use_container_width=True):
+            queue = review["queue"]
+            pos = review["position"]
+            item = queue[pos]
+            if item["editing"]:
+                item["formatted"] = st.session_state.get(f"editable_{session_prefix}_{pos}", item["formatted"])
+                item["manufacturer"] = st.session_state.get(f"editablemaker_{session_prefix}_{pos}", item["manufacturer"])
+            for record in queue:
+                record["verified"] = True
+                record["editing"] = False
+            review["confirm_all"] = False
+            review["verification_skipped"] = True
+            finalize_verified(session_prefix)
+            st.rerun()
+    with no_col:
+        if st.button("Cancel", key=f"cancel_all_{session_prefix}", use_container_width=True):
+            review["confirm_all"] = False
+            review["reopen_review"] = True
+            st.rerun()
+
+
 @st.dialog("Verify RFQ line item", width="large")
 def review_popup(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
@@ -323,9 +386,10 @@ def review_popup(session_prefix):
     left, right = st.columns(2, gap="medium")
     with left:
         st.markdown("**Original text (reference — selectable, not editable)**")
-        # st.code is selectable and does not show the forbidden cursor used by
-        # disabled Streamlit text inputs. It also cannot change source text.
-        st.code(item["source"] or "(No original Internal Note)", language=None, wrap_lines=True)
+        active_draft = (st.session_state.get(edit_text_key, st.session_state[text_key])
+                        if item["editing"] else st.session_state[text_key])
+        colored_reference(item["source"], active_draft)
+        st.caption("Red = source line not found in the formatted text (check before approval).")
     with right:
         st.markdown("**Formatted text**")
         if item["editing"]:
@@ -386,27 +450,8 @@ def review_popup(session_prefix):
     with all_col:
         if st.button("Verify All", key=f"verify_all_{session_prefix}"):
             review["confirm_all"] = True
-            st.rerun(scope="fragment")
-    if review.get("confirm_all"):
-        st.warning("Confirm to skip the verification process at your own risk")
-        yes_col, no_col = st.columns(2)
-        with yes_col:
-            if st.button("Confirm", type="primary", key=f"confirm_all_{session_prefix}"):
-                # Preserve any current edits before confirming the entire queue.
-                if item["editing"]:
-                    item["formatted"] = st.session_state.get(edit_text_key, item["formatted"])
-                    item["manufacturer"] = st.session_state.get(edit_maker_key, item["manufacturer"])
-                for record in queue:
-                    record["verified"] = True
-                    record["editing"] = False
-                review["confirm_all"] = False
-                review["verification_skipped"] = True
-                finalize_verified(session_prefix)
-                st.rerun()
-        with no_col:
-            if st.button("Cancel", key=f"cancel_all_{session_prefix}"):
-                review["confirm_all"] = False
-                st.rerun(scope="fragment")
+            # Full rerun closes review dialog before opening a separate dialog.
+            st.rerun()
 
 
 def review_status(session_prefix):
@@ -598,3 +643,15 @@ with col3:
             st_copy_to_clipboard(st.session_state["manufacturer_list"])
         except ImportError:
             st.caption("Select the text above to copy it.")
+
+# Display at most one modal per Streamlit run. Separate dialogs cannot be nested.
+for _prefix in ("excel", "pdf", "clean"):
+    _review = st.session_state.get(f"{_prefix}_review")
+    if not _review or _review.get("completed"):
+        continue
+    if _review.get("confirm_all"):
+        confirm_verify_all_popup(_prefix)
+        break
+    if _review.pop("reopen_review", False):
+        review_popup(_prefix)
+        break
