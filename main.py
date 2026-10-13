@@ -79,6 +79,11 @@ SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = {"mpn details"}
 PRESERVED_LABELS = {"characteristics"}
+# Narrative subsection titles must not be mistaken for blank attribute fields.
+NARRATIVE_HEADING_PATTERN = re.compile(
+    r"\b(?:requirements?|instructions?|conditions?|notes?|remarks?|scope|deliverables?|documentation)\b",
+    re.I,
+)
 
 
 def is_empty_field(line):
@@ -91,9 +96,10 @@ def is_empty_field(line):
     if ":" in line:
         left, right = line.split(":", 1)
         # Empty field label, including extraction placeholders.
-        if left.strip().casefold() in PRESERVED_LABELS:
+        label = left.strip()
+        if label.casefold() in PRESERVED_LABELS or NARRATIVE_HEADING_PATTERN.search(label):
             return False
-        if left.strip() and right.strip().casefold() in EMPTY_MARKERS:
+        if label and right.strip().casefold() in EMPTY_MARKERS:
             return True
     return False
 
