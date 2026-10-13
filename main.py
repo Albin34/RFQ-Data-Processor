@@ -3,13 +3,7 @@
 Requires GROQ_API_KEY in Streamlit secrets or environment variables.
 Preserves the repository's Excel/PDF/HTS/List Maker workflows.
 """
-import functools
-import json
-import math
-import os
 import re
-import threading
-import time
 import traceback
 from collections import defaultdict
 from copy import copy
@@ -18,56 +12,17 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 from openpyxl import load_workbook
 from PyPDF2 import PdfReader
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stButton button {background:#ff914d;color:white;border-radius:8px;padding:10px 16px;margin-top:10px}
 .stExpander {border-radius:10px}
 </style>""", unsafe_allow_html=True)
-if "show_diagnostics" not in st.session_state:
-    st.session_state.show_diagnostics = False
 
-# Configuration (never commit an API key to GitHub).
-try:
-    API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
-    MODEL = st.secrets.get("GROQ_MODEL", os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"))
-except Exception:
-    API_KEY = os.environ.get("GROQ_API_KEY", "")
-    MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-MIN_INTERVAL_SECONDS = 3.0
-PROMPT_PATH = Path(__file__).with_name("prompt.txt")
-try:
-    FORMAT_PROMPT = PROMPT_PATH.read_text(encoding="utf-8").strip()
-except OSError as exc:
-    st.error(f"Unable to load prompt.txt: {exc}")
-    st.stop()
-if not FORMAT_PROMPT:
-    st.error("prompt.txt is empty.")
-    st.stop()
-if not API_KEY.strip():
-    st.error("Missing GROQ_API_KEY. Add it in Streamlit Cloud app settings > Secrets.")
-    st.stop()
-
-client = OpenAI(api_key=API_KEY.strip(), base_url="https://api.groq.com/openai/v1", timeout=90, max_retries=0)
-
-@st.cache_resource
-def rate_limiter():
-    return {"lock": threading.Lock(), "last": 0.0}
-
-LIMITER = rate_limiter()
-
-def throttled_chat_complete(**kwargs):
-    # Serializes calls across app sessions and spaces request start times.
-    with LIMITER["lock"]:
-        wait = MIN_INTERVAL_SECONDS - (time.monotonic() - LIMITER["last"])
-        if wait > 0:
-            time.sleep(wait)
-        LIMITER["last"] = time.monotonic()
-        return client.chat.completions.create(**kwargs)
+# All formatting is performed locally by deterministic Python rules.
+# No API keys, external inference, models, or network calls are required.
 
 def _clean(value):
     if value is None:
@@ -112,173 +67,126 @@ def show_error(title, exc):
     with st.expander("Error details"):
         st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), language="text")
 
-def message_content(response):
-    if not response.choices or response.choices[0].message.content is None:
-        raise ValueError("Groq returned an empty response")
-    return response.choices[0].message.content.strip()
-
-COMBINED_OUTPUT_INSTRUCTIONS = """
-Extract manufacturer name(s) explicitly stated in the source text, while formatting
-all RFQ text according to the system instructions. Preserve technical details exactly.
-Do not guess manufacturers, part numbers, sizes, quantities or standards.
-Preferred reply: a single valid JSON object with keys "formatted_text" and
-"manufacturer". The formatted_text value must be a string; the manufacturer
-value must be a string (empty if no explicitly identified manufacturer).
-If JSON is difficult, instead reply as:
-<<<FORMATTED_TEXT>>>
-[complete formatted RFQ text]
-<<<MANUFACTURER>>>
-[manufacturer names separated by ' - ', or leave blank]
-No markdown fences, no commentary.
-""".strip()
-
-
-def parse_groq_response(raw):
-    raw = raw.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I).strip()
-    candidates = [cleaned]
-    first, last = cleaned.find("{"), cleaned.rfind("}")
-    if first >= 0 and last > first:
-        candidates.append(cleaned[first:last + 1])
-    for candidate in candidates:
-        try:
-            result = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(result, dict):
-            formatted = result.get("formatted_text", "")
-            maker = result.get("manufacturer", "")
-            if isinstance(maker, list):
-                maker = " - ".join(str(x).strip() for x in maker if str(x).strip())
-            if isinstance(formatted, str) and formatted.strip() and isinstance(maker, str):
-                return formatted.strip(), maker.strip()
-    token1, token2 = "<<<FORMATTED_TEXT>>>", "<<<MANUFACTURER>>>"
-    if token1 in cleaned and token2 in cleaned:
-        before, after = cleaned.split(token1, 1)[1].split(token2, 1)
-        if before.strip():
-            return before.strip(), after.strip().splitlines()[0].strip() if after.strip() else ""
-    raise ValueError("Groq response could not be parsed into formatted_text and manufacturer. Use API Diagnostics to inspect model output.")
-
-
-# Clarifications applied after the original prompt.txt instructions. The original
-# detailed Mistral instructions remain loaded unchanged; this contract resolves
-# contradictory examples and prevents accidental simplification of the RFQ.
-RFQ_FORMAT_CONTRACT = """
-MANDATORY RFQ TRANSCRIPTION CONTRACT (overrides conflicting examples):
-1. formatted_text is PLAIN TEXT, not Markdown and without code fences, preamble,
-   'Formatted text', or commentary. The JSON wrapper is only for the API response.
-2. Preserve ALL nonempty source facts: technical properties, unlabelled product
-   descriptions, PO material text, certificates, material codes, manufacturer
-   references, OEM identifiers, part numbers, dimensions, standards, tag numbers,
-   drawing numbers, order-specific requirements and meaningful remarks. Never
-   abbreviate, paraphrase in a way that loses details, invent, or substitute values.
-3. Section order is strictly: optional Purchase order Text / PO Material Text,
-   Basic Data Text, Classification Text, MPN Text, Inspection Text. Basic Data Text
-   is first unless a substantive purchase-order section precedes it. Never write
-   a section header with no substantive content. Do not invent missing sections.
-4. Transfer substantive PO Material Text content into Basic Data Text without
-   duplication unless the source clearly provides an actual separate purchase
-   order section that should be reproduced. PO Material Text may appear before
-   Basic Data Text as a header only when required for an actual separate section.
-5. Deduplicate *only exact repeated facts* where safe. Never remove distinct
-   manufacturer entries, separate part numbers, or slightly different values.
-   Identical duplicate manufacturer/part-number pairs may be consolidated.
-6. Omit fields whose values are empty, whitespace, '--', '---' or just a colon.
-   Keep ALL nonempty field values. Never output placeholder '-' as a value unless
-   '-' is genuinely part of a technical specification.
-7. Keep the raw source's technical spelling, capitalization, numbers and units
-   where possible. Copy MPN, OEM, manufacturer code, drawing and tag numbers
-   exactly as given. If multiple manufacturers are explicitly present, include
-   all; otherwise manufacturer is an empty string, never a guess.
-8. The mandatory JSON keys are formatted_text and manufacturer. formatted_text
-   must contain the plain text formatted RFQ. manufacturer is only the explicitly
-   stated name(s), not an explanation.
-""".strip()
-
-
-def validate_rfq_sections(formatted):
-    """Reject misordered or duplicated top-level sections; don't alter RFQ content."""
-    headings = {
-        "purchase order text": 0, "purchase order text:": 0,
-        "po material text": 0, "po material text:": 0,
-        "basic data text": 1, "basic data text:": 1,
-        "classification text": 2, "classification text:": 2,
-        "mpn text": 3, "mpn text:": 3,
-        "inspection text": 4, "inspection text:": 4,
-    }
-    found = []
-    for line in formatted.splitlines():
-        normalized = re.sub(r"\s+", " ", line.strip()).casefold()
-        if normalized in headings:
-            found.append((headings[normalized], line.strip()))
-    positions = [order for order, _ in found]
-    if positions != sorted(positions):
-        raise ValueError(f"Groq returned RFQ sections out of order: {[name for _, name in found]}")
-    if len(positions) != len(set(positions)):
-        raise ValueError(f"Groq returned duplicate RFQ section headers: {[name for _, name in found]}")
-    if not formatted.strip():
-        raise ValueError("Groq returned an empty RFQ description")
-
-
-# Groq GPT-OSS 20B supports strict structured outputs (JSON schema).
-# This prevents ordinary completions from breaking RFQ processing due to
-# missing field names, markdown output, or unexpected response formats.
-RFQ_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "rfq_formatting",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "formatted_text": {"type": "string"},
-                "manufacturer": {"type": "string"},
-            },
-            "required": ["formatted_text", "manufacturer"],
-            "additionalProperties": False,
-        },
-    },
+# Recognize headings even in reversed/extracted text (e.g. some PDFs).
+SECTION_PATTERNS = {
+    "Basic Data Text": re.compile(r"^basic\s+data(?:\s+text)?\s*:?\s*$", re.I),
+    "Classification Text": re.compile(r"^classification\s+text\s*:?\s*$", re.I),
+    "MPN Text": re.compile(r"^mpn\s+text\s*:?\s*$", re.I),
+    "Inspection Text": re.compile(r"^inspection\s+text\s*:?\s*$", re.I),
+    "PO Material Text": re.compile(r"^(?:po\s+material|purchase\s+order)\s+text\s*:?\s*$", re.I),
 }
+SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
+EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
+META_LINES = {"mpn details"}
 
-# Retry transient network errors, not malformed data or invalid requests.
-@functools.lru_cache(maxsize=1024)
-@retry(wait=wait_exponential(multiplier=2, min=2, max=20), stop=stop_after_attempt(3),
-       retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)), reraise=True)
-def process_rfq_text(text):
-    cleaned = _clean(text)
-    if not cleaned:
-        return "", ""
-    if MODEL != "openai/gpt-oss-20b":
-        st.warning("This version's strict structured output is tested for openai/gpt-oss-20b only. Check compatibility before changing GROQ_MODEL.")
-    response = throttled_chat_complete(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": FORMAT_PROMPT + "\n\n" + RFQ_FORMAT_CONTRACT + "\n\n" + COMBINED_OUTPUT_INSTRUCTIONS + "\nReturn only the two required fields, formatted_text and manufacturer."},
-            {"role": "user", "content": cleaned},
-        ],
-        temperature=0,
-        response_format=RFQ_RESPONSE_FORMAT,
-        reasoning_effort="low",
-        max_completion_tokens=8192,
+
+def is_empty_field(line):
+    """Drop only genuinely empty attribute fields; preserve prose and technical values."""
+    line = line.strip()
+    if not line:
+        return True
+    if line.casefold() in META_LINES:
+        return True
+    if ":" in line:
+        left, right = line.split(":", 1)
+        # Empty field label, including extraction placeholders.
+        if left.strip() and right.strip().casefold() in EMPTY_MARKERS:
+            return True
+    return False
+
+
+def match_section(line):
+    for name, pattern in SECTION_PATTERNS.items():
+        if pattern.fullmatch(line.strip()):
+            return name
+    return None
+
+
+def extract_manufacturers(text):
+    """Only extract explicitly marked manufacturers; never infer from a product name."""
+    names = []
+    patterns = (
+        re.compile(r"^manufacturer\s+number\s*:\s*[^\s]+\s*[-–]\s*(.+)$", re.I),
+        re.compile(r"^(?:manufacturer(?:\s+name)?|mfr|mfg|make)\s*:\s*(.+)$", re.I),
     )
-    raw = message_content(response)
-    try:
-        formatted, manufacturer = parse_groq_response(raw)
-    except ValueError as exc:
-        choice = response.choices[0]
-        raise ValueError(
-            "Groq did not return the required fields. "
-            f"Finish reason: {choice.finish_reason}; "
-            f"response preview: {raw[:400]!r}"
-        ) from exc
-    if not formatted.strip():
-        raise ValueError("Groq returned an empty formatted_text; original RFQ text was not overwritten.")
-    validate_rfq_sections(formatted)
-    return formatted.replace("`", ""), manufacturer.replace("`", "")
+    for line in text.splitlines():
+        value = line.strip()
+        for pattern in patterns:
+            match = pattern.match(value)
+            if match:
+                name = match.group(1).strip()
+                if name and name.casefold() not in EMPTY_MARKERS and name.casefold() not in {n.casefold() for n in names}:
+                    names.append(name)
+                break
+    return " - ".join(names)
 
-# Compatibility with old callers.
+
+def format_rfq_python(text):
+    """Preservation-first deterministic formatter. Never fabricate or paraphrase values.
+
+    The original text is always retained in the review pane, and the user must
+    verify every line. Unrecognized content is included instead of discarded.
+    """
+    raw = _clean(text).replace("\r\n", "\n").replace("\r", "\n")
+    if not raw:
+        return "", ""
+    # Map supplied lines to known sections without losing free-form descriptions.
+    sections = {name: [] for name in SECTION_ORDER}
+    active = "Basic Data Text"
+    original_lines = [line.strip() for line in raw.split("\n")]
+    for line in original_lines:
+        if not line:
+            continue
+        header = match_section(line)
+        if header:
+            active = header
+            continue
+        if is_empty_field(line):
+            continue
+        sections[active].append(line)
+
+    # In SAP extracts PO Material Text often acts as a carrier of Basic Data.
+    # Keep a separate PO section only for genuine purchase-order prose preceding
+    # a populated basic-data section; otherwise move its text under Basic Data.
+    po_lines = sections["PO Material Text"]
+    if po_lines:
+        if sections["Basic Data Text"]:
+            # When both have content, preserve both separately for user review.
+            pass
+        else:
+            sections["Basic Data Text"] = po_lines
+            sections["PO Material Text"] = []
+
+    # Collapse exact adjacent/nonadjacent duplicates ONLY in a single section.
+    # Preserve duplicate PO, basic and inspection lines because they can convey
+    # distinct requirements despite identical wording; MPN repeats are commonly
+    # duplicated by SAP and are safe to consolidate exactly.
+    mpn = sections["MPN Text"]
+    seen = set()
+    deduped = []
+    for line in mpn:
+        if line not in seen:
+            deduped.append(line)
+            seen.add(line)
+    sections["MPN Text"] = deduped
+
+    chunks = []
+    for section in SECTION_ORDER:
+        lines = sections[section]
+        if lines:
+            chunks.append(section + ":\n" + "\n".join(lines))
+    # Always preserve relevant data, even when no headers were present.
+    output = "\n\n".join(chunks)
+    return output, extract_manufacturers(raw)
+
+
+def process_rfq_text(text):
+    return format_rfq_python(text)
+
+
 def format_text(text):
     return process_rfq_text(text)[0]
+
 
 def manufacture_name(text):
     return process_rfq_text(text)[1]
@@ -316,73 +224,150 @@ def resolve_template(uploaded, default_filename):
         raise FileNotFoundError(f"Missing default template: {path.name}. Please upload a template.")
     return path
 
-def process_to_final(records, template, suffix, session_prefix, upload_wb=None):
-    """Records: (line, desc, qty, uom, source_note) tuples."""
-    wb = load_workbook(template)
-    sheet = wb.active
-    clear_template_rows(sheet)
-    count = len(records)
-    progress = st.progress(0)
-    status = st.empty()
-    for i, (line, desc, qty, uom, note) in enumerate(records, 1):
-        status.write(f"Processing item {i} of {count}")
+def prepare_review(records, template, suffix, session_prefix, upload_wb=None):
+    """Pre-format all rows instantly, queue for mandatory per-row verification."""
+    if not records:
+        raise ValueError("No RFQ items to process")
+    # Validate the template before initializing a review session.
+    template_wb = load_workbook(template)
+    template_data = workbook_bytes(template_wb)
+    queue = []
+    for line, desc, qty, uom, note in records:
         formatted, manufacturer = process_rfq_text(note)
-        target = i + 1
-        for col, value in {"A":line, "B":desc, "C":qty, "D":uom, "E":formatted, "G":manufacturer}.items():
-            sheet[f"{col}{target}"] = value
-        progress.progress(i/count)
-    # Customize the FINAL SHEET output (all processing modes):
-    # E: PO Text -> Internal Note; drop H: mail id and F: Subject line.
-    # Delete from right to left so G: Manufacturer moves to F correctly.
-    sheet["E1"] = "Internal Note"
-    sheet.delete_cols(8, 1)  # H = mail id
-    sheet.delete_cols(6, 1)  # F = Subject line
-    # Output must contain only the first (formatted) working sheet.
-    for extra_sheet in list(wb.worksheets):
-        if extra_sheet is not sheet:
-            wb.remove(extra_sheet)
-    wrap_all(sheet)
-    st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
+        queue.append({"line": line, "desc": desc, "qty": qty, "uom": uom,
+                      "source": _clean(note), "formatted": formatted,
+                      "manufacturer": manufacturer, "verified": False, "editing": False})
+    for old_key in list(st.session_state):
+        if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_")):
+            del st.session_state[old_key]
+    st.session_state[f"{session_prefix}_review"] = {
+        "queue": queue, "position": 0, "suffix": suffix,
+        "template": template_data,
+        "upload_bytes": workbook_bytes(upload_wb) if upload_wb is not None else None,
+    }
+    # Uploading Sheet has no AI formatting and can be downloaded immediately.
+    st.session_state.pop(f"{session_prefix}_final_bytes", None)
+    st.session_state[f"{session_prefix}_suffix"] = suffix
     if upload_wb is not None:
         st.session_state[f"{session_prefix}_upload_bytes"] = workbook_bytes(upload_wb)
-    st.session_state[f"{session_prefix}_suffix"] = suffix
-    status.empty()
-    progress.empty()
+    else:
+        st.session_state.pop(f"{session_prefix}_upload_bytes", None)
+
+
+def finalize_verified(session_prefix):
+    review = st.session_state[f"{session_prefix}_review"]
+    queue = review["queue"]
+    if not queue or not all(item["verified"] for item in queue):
+        raise ValueError("All RFQ items must be verified before exporting")
+    wb = load_workbook(BytesIO(review["template"]))
+    sheet = wb.active
+    clear_template_rows(sheet)
+    for i, item in enumerate(queue, 2):
+        for col, value in {
+            "A": item["line"], "B": item["desc"], "C": item["qty"],
+            "D": item["uom"], "E": item["formatted"],
+            "G": item["manufacturer"],
+        }.items():
+            sheet[f"{col}{i}"] = value
+    sheet["E1"] = "Internal Note"
+    sheet.delete_cols(8, 1)  # mail id
+    sheet.delete_cols(6, 1)  # Subject line; Manufacturer moves to F
+    for other in list(wb.worksheets):
+        if other is not sheet:
+            wb.remove(other)
+    wrap_all(sheet)
+    st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
+    if review["upload_bytes"] is not None:
+        st.session_state[f"{session_prefix}_upload_bytes"] = review["upload_bytes"]
+    st.session_state[f"{session_prefix}_suffix"] = review["suffix"]
+    review["completed"] = True
+
+
+@st.dialog("Verify RFQ line item", width="large")
+def review_popup(session_prefix):
+    review = st.session_state.get(f"{session_prefix}_review")
+    if not review or review.get("completed"):
+        return
+    queue = review["queue"]
+    position = review["position"]
+    item = queue[position]
+    st.write(f"**Line {item['line']} — item {position + 1} of {len(queue)}**")
+    st.progress(sum(1 for record in queue if record["verified"]) / len(queue))
+    left, right = st.columns(2, gap="medium")
+    with left:
+        st.markdown("**Original text (read-only)**")
+        st.text_area("Original Internal Note", value=item["source"], height=390,
+                     disabled=True, key=f"original_{session_prefix}_{position}")
+    with right:
+        st.markdown("**Formatted text**")
+        st.text_area("Formatted Internal Note", value=item["formatted"],
+                     height=390, disabled=not item["editing"], key=f"formatted_{session_prefix}_{position}")
+        st.text_input("Manufacturer (editable)", value=item["manufacturer"],
+                      disabled=not item["editing"], key=f"maker_{session_prefix}_{position}")
+    if not item["source"]:
+        st.info("This item has an empty source note. Verify it if the blank note is intentional.")
+    st.caption("Click Edit to correct the right-hand text or manufacturer, then click Verify. Every line requires explicit approval.")
+    back_col, skip_col, edit_col, confirm_col = st.columns([1, 1.5, 1, 2])
+    with back_col:
+        if st.button("Previous", disabled=position == 0, key=f"back_{session_prefix}"):
+            # Keep unverified edits while navigating, but never approve implicitly.
+            item["formatted"] = st.session_state[f"formatted_{session_prefix}_{position}"]
+            item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"]
+            if item["formatted"] != st.session_state[f"formatted_{session_prefix}_{position}"] or item["manufacturer"] != st.session_state[f"maker_{session_prefix}_{position}"]:
+                item["verified"] = False
+            review["position"] -= 1
+            st.rerun()
+    with skip_col:
+        if st.button("Close / resume later", key=f"close_{session_prefix}"):
+            item["formatted"] = st.session_state[f"formatted_{session_prefix}_{position}"]
+            item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"]
+            st.rerun()
+    with edit_col:
+        if st.button("Edit" if not item["editing"] else "Editing", key=f"edit_{session_prefix}",
+                     disabled=item["editing"]):
+            item["editing"] = True
+            st.rerun()
+    with confirm_col:
+        if st.button("Verify & Next" if position + 1 < len(queue) else "Verify & Finish",
+                     type="primary", key=f"verify_{session_prefix}", use_container_width=True):
+            updated = st.session_state[f"formatted_{session_prefix}_{position}"].strip()
+            if item["source"] and not updated:
+                st.error("Formatted text cannot be empty when the original text has content.")
+            else:
+                item["formatted"] = updated
+                item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"].strip()
+                item["verified"] = True
+                if all(row["verified"] for row in queue):
+                    finalize_verified(session_prefix)
+                else:
+                    pending = [i for i, row in enumerate(queue) if not row["verified"]]
+                    review["position"] = next((i for i in pending if i > position), pending[0])
+                st.rerun()
+
+
+def review_status(session_prefix):
+    review = st.session_state.get(f"{session_prefix}_review")
+    if not review:
+        return
+    if review.get("completed"):
+        st.success("All line items verified. Your output files are ready.")
+        return
+    queue = review["queue"]
+    done = sum(1 for row in queue if row["verified"])
+    st.info(f"Prepared {len(queue)} line items locally. Verified {done}/{len(queue)}. "
+            "The Working Sheet becomes available after every line is verified.")
+    if st.button("Open verification window / resume", key=f"resume_{session_prefix}"):
+        review_popup(session_prefix)
+    if st.button("Cancel current verification", key=f"cancel_{session_prefix}"):
+        st.session_state.pop(f"{session_prefix}_review", None)
+        st.rerun()
+
 
 def download_xlsx(label, data, filename, key):
     st.download_button(label, data, file_name=filename,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
-if st.button("API Diagnostics", key="toggle_diagnostics"):
-    st.session_state.show_diagnostics = not st.session_state.show_diagnostics
-if st.session_state.show_diagnostics:
-    with st.container(border=True):
-        st.subheader("Groq API Diagnostics")
-        st.caption(f"Provider: Groq Cloud | Model: {MODEL} | Key configured: {'Yes' if API_KEY else 'No'}")
-        st.caption(f"Request spacing: {MIN_INTERVAL_SECONDS} seconds; actual account rate limits also apply.")
-        test_col1, test_col2 = st.columns(2)
-        with test_col1:
-            if st.button("1. Test standard chat API", key="diag_chat"):
-                try:
-                    reply = throttled_chat_complete(
-                        model=MODEL,
-                        messages=[{"role": "user", "content": "Reply with exactly: CHAT API OK"}],
-                        temperature=0,
-                    )
-                    st.success("Chat API responded")
-                    st.code(message_content(reply), language="text")
-                except Exception as exc:
-                    show_error("Chat API test failed", exc)
-        with test_col2:
-            if st.button("2. Test RFQ processing", key="diag_rfq"):
-                try:
-                    sample = "Basic Data Text:\nVALVE, SOLENOID\nPRESSURE RATING: 320 BAR\nMANUFACTURER: DANA CORPORATION"
-                    formatted, manufacturer = process_rfq_text(sample)
-                    st.success("Combined RFQ processing succeeded")
-                    st.code(formatted, language="text")
-                    st.write("Manufacturer:", manufacturer)
-                except Exception as exc:
-                    show_error("RFQ processing test failed", exc)
+st.caption("Processing engine: Python rules only | AI/API: Disabled | Every Working Sheet line requires approval")
 
 col1, col2, col3 = st.columns([2, 2, 1])
 
@@ -430,14 +415,17 @@ with col1:
                         upload_sheet[f"{c}{row}"] = value
                     records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
                 wrap_all(upload_sheet)
-                process_to_final(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb)
-                st.success("Excel processed")
+                prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb)
+                st.success("Excel RFQ prepared for verification")
+                review_popup("excel")
             except Exception as exc:
                 show_error("Excel processing failed (no incomplete files were saved)", exc)
+    review_status("excel")
     if "excel_upload_bytes" in st.session_state:
         s = st.session_state["excel_suffix"]
         download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_excel_up")
-        download_xlsx("Download FINAL SHEET", st.session_state["excel_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_excel_fin")
+        if "excel_final_bytes" in st.session_state:
+            download_xlsx("Download Working Sheet", st.session_state["excel_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_excel_fin")
 
 with col2:
     st.subheader("PDF Data Processor")
@@ -469,14 +457,17 @@ with col2:
                         sheet[f"{col}{i}"] = normalize_qty(item[field]) if field == "QTY" else item[field]
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
-                process_to_final(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb)
-                st.success("PDF processed")
+                prepare_review(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb)
+                st.success("PDF RFQ prepared for verification")
+                review_popup("pdf")
             except Exception as exc:
                 show_error("PDF processing failed (no incomplete files were saved)", exc)
+    review_status("pdf")
     if "pdf_upload_bytes" in st.session_state:
         s = st.session_state["pdf_suffix"]
         download_xlsx("Download Upload file", st.session_state["pdf_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_pdf_up")
-        download_xlsx("Download FINAL SHEET", st.session_state["pdf_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_pdf_fin")
+        if "pdf_final_bytes" in st.session_state:
+            download_xlsx("Download Working Sheet", st.session_state["pdf_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_pdf_fin")
 
 with col3:
     st.subheader("HTS Cleaner")
@@ -497,10 +488,12 @@ with col3:
                     if len(row) < 8:
                         raise ValueError("HTS workbook must have at least eight columns")
                     records.append((row[1].value, row[4].value, row[6].value, row[7].value, row[5].value or ""))
-                process_to_final(records, resolve_template(clean_final_tpl, "FINAL SHEET.xlsx"), "cleaned", "clean")
-                st.success("HTS cleaned")
+                prepare_review(records, resolve_template(clean_final_tpl, "FINAL SHEET.xlsx"), "cleaned", "clean")
+                st.success("HTS RFQ prepared for verification")
+                review_popup("clean")
             except Exception as exc:
                 show_error("HTS cleaning failed (no incomplete files were saved)", exc)
+    review_status("clean")
     if "clean_final_bytes" in st.session_state:
         download_xlsx("Download cleaned FINAL SHEET", st.session_state["clean_final_bytes"], "Working Sheet_cleaned.xlsx", "dl_clean")
 
