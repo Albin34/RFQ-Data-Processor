@@ -172,6 +172,23 @@ def format_rfq_python(text):
             seen.add(line)
     sections["MPN Text"] = deduped
 
+    # Separate different manufacturer/part-number sets with a blank line.
+    # A new Manufacturer Part Number following an earlier manufacturer-number
+    # line begins another set; never change the original specification values.
+    mpn_lines = sections["MPN Text"]
+    separated_mpn = []
+    previous_set_has_manufacturer = False
+    for line in mpn_lines:
+        is_part_number = bool(re.match(r"^Manufacturer\s+Part\s+Number\s*:", line, re.I))
+        is_manufacturer_number = bool(re.match(r"^Manufacturer\s+number\s*:", line, re.I))
+        if is_part_number and previous_set_has_manufacturer and separated_mpn:
+            separated_mpn.append("")
+            previous_set_has_manufacturer = False
+        separated_mpn.append(line)
+        if is_manufacturer_number:
+            previous_set_has_manufacturer = True
+    sections["MPN Text"] = separated_mpn
+
     chunks = []
     for section in SECTION_ORDER:
         lines = sections[section]
@@ -240,7 +257,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None):
                       "source": _clean(note), "formatted": formatted,
                       "manufacturer": manufacturer, "verified": False, "editing": False})
     for old_key in list(st.session_state):
-        if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_")):
+        if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_", f"editable_{session_prefix}_", f"editablemaker_{session_prefix}_")):
             del st.session_state[old_key]
     st.session_state[f"{session_prefix}_review"] = {
         "queue": queue, "position": 0, "suffix": suffix,
@@ -301,6 +318,8 @@ def review_popup(session_prefix):
         st.session_state[text_key] = item["formatted"]
     if maker_key not in st.session_state:
         st.session_state[maker_key] = item["manufacturer"]
+    edit_text_key = f"editable_{session_prefix}_{position}"
+    edit_maker_key = f"editablemaker_{session_prefix}_{position}"
     left, right = st.columns(2, gap="medium")
     with left:
         st.markdown("**Original text (reference — selectable, not editable)**")
@@ -310,41 +329,51 @@ def review_popup(session_prefix):
     with right:
         st.markdown("**Formatted text**")
         if item["editing"]:
-            st.text_area("Formatted Internal Note", height=390, key=text_key)
-            st.text_input("Manufacturer", key=maker_key)
+            # Separate widget keys prevent Streamlit from resetting the stored
+            # draft when switching a read-only code block into an editor.
+            if edit_text_key not in st.session_state:
+                st.session_state[edit_text_key] = st.session_state[text_key]
+            if edit_maker_key not in st.session_state:
+                st.session_state[edit_maker_key] = st.session_state[maker_key]
+            st.text_area("Formatted Internal Note", height=390, key=edit_text_key)
+            st.text_input("Manufacturer", key=edit_maker_key)
         else:
             st.code(st.session_state[text_key] or "(Empty formatted text)", language=None, wrap_lines=True)
             st.caption("Manufacturer: " + (st.session_state[maker_key] or "(Not identified)"))
     if not item["source"]:
         st.info("This item has an empty source note. Verify it if the blank note is intentional.")
     st.caption("Click Edit to correct the right-hand text or manufacturer, then click Verify. Every line requires explicit approval.")
-    back_col, skip_col, edit_col, confirm_col = st.columns([1, 1.5, 1, 2])
+    back_col, skip_col, edit_col, confirm_col, all_col = st.columns([1, 1.5, 1, 2, 1.2])
     with back_col:
         if st.button("Previous", disabled=position == 0, key=f"back_{session_prefix}"):
-            item["formatted"] = st.session_state[text_key]
-            item["manufacturer"] = st.session_state[maker_key]
+            item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
+            item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
             review["position"] -= 1
             st.rerun(scope="fragment")
     with skip_col:
         if st.button("Close / resume later", key=f"close_{session_prefix}"):
-            item["formatted"] = st.session_state[text_key]
-            item["manufacturer"] = st.session_state[maker_key]
+            item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
+            item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
             st.rerun()
     with edit_col:
         if st.button("Edit" if not item["editing"] else "Editing", key=f"edit_{session_prefix}",
                      disabled=item["editing"]):
+            # Copy the visible draft into dedicated edit fields before
+            # switching widgets, so the editor never starts out empty.
+            st.session_state[edit_text_key] = st.session_state[text_key]
+            st.session_state[edit_maker_key] = st.session_state[maker_key]
             item["editing"] = True
             # Re-render only this dialog, not the full app, so it stays open.
             st.rerun(scope="fragment")
     with confirm_col:
         if st.button("Verify & Next" if position + 1 < len(queue) else "Verify & Finish",
                      type="primary", key=f"verify_{session_prefix}", use_container_width=True):
-            updated = st.session_state[text_key].strip()
+            updated = (st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]).strip()
             if item["source"] and not updated:
                 st.error("Formatted text cannot be empty when the original text has content.")
             else:
                 item["formatted"] = updated
-                item["manufacturer"] = st.session_state[maker_key].strip()
+                item["manufacturer"] = (st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]).strip()
                 item["verified"] = True
                 item["editing"] = False
                 if all(row["verified"] for row in queue):
@@ -354,6 +383,30 @@ def review_popup(session_prefix):
                     pending = [i for i, row in enumerate(queue) if not row["verified"]]
                     review["position"] = next((i for i in pending if i > position), pending[0])
                     st.rerun(scope="fragment")
+    with all_col:
+        if st.button("Verify All", key=f"verify_all_{session_prefix}"):
+            review["confirm_all"] = True
+            st.rerun(scope="fragment")
+    if review.get("confirm_all"):
+        st.warning("Confirm to skip the verification process at your own risk")
+        yes_col, no_col = st.columns(2)
+        with yes_col:
+            if st.button("Confirm", type="primary", key=f"confirm_all_{session_prefix}"):
+                # Preserve any current edits before confirming the entire queue.
+                if item["editing"]:
+                    item["formatted"] = st.session_state.get(edit_text_key, item["formatted"])
+                    item["manufacturer"] = st.session_state.get(edit_maker_key, item["manufacturer"])
+                for record in queue:
+                    record["verified"] = True
+                    record["editing"] = False
+                review["confirm_all"] = False
+                review["verification_skipped"] = True
+                finalize_verified(session_prefix)
+                st.rerun()
+        with no_col:
+            if st.button("Cancel", key=f"cancel_all_{session_prefix}"):
+                review["confirm_all"] = False
+                st.rerun(scope="fragment")
 
 
 def review_status(session_prefix):
@@ -361,7 +414,10 @@ def review_status(session_prefix):
     if not review:
         return
     if review.get("completed"):
-        st.success("All line items verified. Your output files are ready.")
+        if review.get("verification_skipped"):
+            st.warning("Verification skipped by user confirmation. Please review the Working Sheet before sending.")
+        else:
+            st.success("All line items verified. Your output files are ready.")
         return
     queue = review["queue"]
     done = sum(1 for row in queue if row["verified"])
