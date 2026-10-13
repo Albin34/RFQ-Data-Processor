@@ -1,7 +1,6 @@
-"""RFQ Data Processor - Groq edition.
+"""RFQ Data Processor - Python-only verification edition.
 
-Requires GROQ_API_KEY in Streamlit secrets or environment variables.
-Preserves the repository's Excel/PDF/HTS/List Maker workflows.
+Preserves the Excel/PDF/HTS/List Maker workflows without external AI APIs.
 """
 import re
 import traceback
@@ -78,6 +77,7 @@ SECTION_PATTERNS = {
 SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = {"mpn details"}
+PRESERVED_LABELS = {"characteristics"}
 
 
 def is_empty_field(line):
@@ -90,6 +90,8 @@ def is_empty_field(line):
     if ":" in line:
         left, right = line.split(":", 1)
         # Empty field label, including extraction placeholders.
+        if left.strip().casefold() in PRESERVED_LABELS:
+            return False
         if left.strip() and right.strip().casefold() in EMPTY_MARKERS:
             return True
     return False
@@ -293,56 +295,65 @@ def review_popup(session_prefix):
     item = queue[position]
     st.write(f"**Line {item['line']} — item {position + 1} of {len(queue)}**")
     st.progress(sum(1 for record in queue if record["verified"]) / len(queue))
+    text_key = f"formatted_{session_prefix}_{position}"
+    maker_key = f"maker_{session_prefix}_{position}"
+    if text_key not in st.session_state:
+        st.session_state[text_key] = item["formatted"]
+    if maker_key not in st.session_state:
+        st.session_state[maker_key] = item["manufacturer"]
     left, right = st.columns(2, gap="medium")
     with left:
-        st.markdown("**Original text (read-only)**")
-        st.text_area("Original Internal Note", value=item["source"], height=390,
-                     disabled=True, key=f"original_{session_prefix}_{position}")
+        st.markdown("**Original text (reference — selectable, not editable)**")
+        # st.code is selectable and does not show the forbidden cursor used by
+        # disabled Streamlit text inputs. It also cannot change source text.
+        st.code(item["source"] or "(No original Internal Note)", language=None, wrap_lines=True)
     with right:
         st.markdown("**Formatted text**")
-        st.text_area("Formatted Internal Note", value=item["formatted"],
-                     height=390, disabled=not item["editing"], key=f"formatted_{session_prefix}_{position}")
-        st.text_input("Manufacturer (editable)", value=item["manufacturer"],
-                      disabled=not item["editing"], key=f"maker_{session_prefix}_{position}")
+        if item["editing"]:
+            st.text_area("Formatted Internal Note", height=390, key=text_key)
+            st.text_input("Manufacturer", key=maker_key)
+        else:
+            st.code(st.session_state[text_key] or "(Empty formatted text)", language=None, wrap_lines=True)
+            st.caption("Manufacturer: " + (st.session_state[maker_key] or "(Not identified)"))
     if not item["source"]:
         st.info("This item has an empty source note. Verify it if the blank note is intentional.")
     st.caption("Click Edit to correct the right-hand text or manufacturer, then click Verify. Every line requires explicit approval.")
     back_col, skip_col, edit_col, confirm_col = st.columns([1, 1.5, 1, 2])
     with back_col:
         if st.button("Previous", disabled=position == 0, key=f"back_{session_prefix}"):
-            # Keep unverified edits while navigating, but never approve implicitly.
-            item["formatted"] = st.session_state[f"formatted_{session_prefix}_{position}"]
-            item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"]
-            if item["formatted"] != st.session_state[f"formatted_{session_prefix}_{position}"] or item["manufacturer"] != st.session_state[f"maker_{session_prefix}_{position}"]:
-                item["verified"] = False
+            item["formatted"] = st.session_state[text_key]
+            item["manufacturer"] = st.session_state[maker_key]
             review["position"] -= 1
-            st.rerun()
+            st.rerun(scope="fragment")
     with skip_col:
         if st.button("Close / resume later", key=f"close_{session_prefix}"):
-            item["formatted"] = st.session_state[f"formatted_{session_prefix}_{position}"]
-            item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"]
+            item["formatted"] = st.session_state[text_key]
+            item["manufacturer"] = st.session_state[maker_key]
             st.rerun()
     with edit_col:
         if st.button("Edit" if not item["editing"] else "Editing", key=f"edit_{session_prefix}",
                      disabled=item["editing"]):
             item["editing"] = True
-            st.rerun()
+            # Re-render only this dialog, not the full app, so it stays open.
+            st.rerun(scope="fragment")
     with confirm_col:
         if st.button("Verify & Next" if position + 1 < len(queue) else "Verify & Finish",
                      type="primary", key=f"verify_{session_prefix}", use_container_width=True):
-            updated = st.session_state[f"formatted_{session_prefix}_{position}"].strip()
+            updated = st.session_state[text_key].strip()
             if item["source"] and not updated:
                 st.error("Formatted text cannot be empty when the original text has content.")
             else:
                 item["formatted"] = updated
-                item["manufacturer"] = st.session_state[f"maker_{session_prefix}_{position}"].strip()
+                item["manufacturer"] = st.session_state[maker_key].strip()
                 item["verified"] = True
+                item["editing"] = False
                 if all(row["verified"] for row in queue):
                     finalize_verified(session_prefix)
+                    st.rerun()
                 else:
                     pending = [i for i, row in enumerate(queue) if not row["verified"]]
                     review["position"] = next((i for i in pending if i > position), pending[0])
-                st.rerun()
+                    st.rerun(scope="fragment")
 
 
 def review_status(session_prefix):
