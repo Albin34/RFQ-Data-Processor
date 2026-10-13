@@ -309,29 +309,37 @@ def _comparison_line(line):
 
 
 def colored_reference(original, formatted):
-    """Selectable source text, red if a nonblank line is absent from the draft.
+    """Display original source with exact line breaks and red unmatched lines.
 
-    Presentation-only line matching, not a semantic completeness test.
+    st.html renders HTML directly, unlike Markdown which can collapse whitespace
+    inside mixed HTML/Markdown blocks. All source text is HTML-escaped.
     """
     formatted_lines = [_comparison_line(x) for x in formatted.splitlines() if x.strip()]
-    spans = []
+    highlighted_lines = []
     for line in original.splitlines():
         token = _comparison_line(line)
-        matched = not token or any(token == candidate or (len(token) > 16 and token in candidate)
-                                       for candidate in formatted_lines)
-        safe = html.escape(line)
+        matched = not token or any(
+            token == candidate or (len(token) > 16 and token in candidate)
+            for candidate in formatted_lines
+        )
+        safe_line = html.escape(line)
         if not matched:
-            spans.append(f'<span style="color:#ff7373;font-weight:600">{safe}</span>')
-        else:
-            spans.append(safe)
-    content = "\n".join(spans) if spans else "(No original Internal Note)"
-    st.markdown(
+            safe_line = f'<span style="color:#ff7373;font-weight:600">{safe_line}</span>'
+        highlighted_lines.append(safe_line)
+
+    # Preserve trailing newlines as well as empty lines separating original sections.
+    content = "\n".join(highlighted_lines)
+    if original.endswith("\n"):
+        content += "\n"
+    if not original:
+        content = "(No original Internal Note)"
+
+    st.html(
         '<div style="background:#1a1d26;color:#f4f4f5;border-radius:8px;'
         'padding:16px;max-height:460px;overflow:auto;user-select:text">'
         '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;'
         'font-family:monospace;font-size:13px;line-height:1.65;'
-        'margin:0;color:inherit">' + content + '</pre></div>',
-        unsafe_allow_html=True,
+        'margin:0;color:inherit">' + content + '</pre></div>'
     )
 
 
