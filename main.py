@@ -321,12 +321,26 @@ def _comparison_line(line):
     return re.sub(r"\s+", "", line).casefold()
 
 
-def colored_reference(original, formatted):
-    """Display original source with exact line breaks and red unmatched lines.
+REVIEW_PANEL_HEIGHT = 510
 
-    st.html renders HTML directly, unlike Markdown which can collapse whitespace
-    inside mixed HTML/Markdown blocks. All source text is HTML-escaped.
-    """
+
+def _review_panel(body, *, empty_label="(No text)"):
+    """Matching, independent, fixed-height panels for both review columns."""
+    content = body if body else html.escape(empty_label)
+    st.html(
+        '<div style="box-sizing:border-box;height:' + str(REVIEW_PANEL_HEIGHT) + 'px;'
+        'overflow-y:auto;overflow-x:hidden;background:#1a1d26;color:#f4f4f5;'
+        'border:1px solid #363b48;border-radius:10px;padding:16px;'
+        'user-select:text;scrollbar-gutter:stable">'
+        '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;'
+        'font-family:ui-monospace,SFMono-Regular,Consolas,monospace;'
+        'font-size:13px;line-height:1.6;margin:0;color:inherit">'
+        + content + '</pre></div>'
+    )
+
+
+def colored_reference(original, formatted):
+    """Original text with preserved whitespace and red unmatched lines."""
     formatted_lines = [_comparison_line(x) for x in formatted.splitlines() if x.strip()]
     highlighted_lines = []
     for line in original.splitlines():
@@ -339,21 +353,15 @@ def colored_reference(original, formatted):
         if not matched:
             safe_line = f'<span style="color:#ff7373;font-weight:600">{safe_line}</span>'
         highlighted_lines.append(safe_line)
-
-    # Preserve trailing newlines as well as empty lines separating original sections.
     content = "\n".join(highlighted_lines)
     if original.endswith("\n"):
         content += "\n"
-    if not original:
-        content = "(No original Internal Note)"
+    _review_panel(content, empty_label="(No original Internal Note)")
 
-    st.html(
-        '<div style="background:#1a1d26;color:#f4f4f5;border-radius:8px;'
-        'padding:16px;max-height:460px;overflow:auto;user-select:text">'
-        '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;'
-        'font-family:monospace;font-size:13px;line-height:1.65;'
-        'margin:0;color:inherit">' + content + '</pre></div>'
-    )
+
+def formatted_reference(formatted):
+    """Use precisely the same visual container as the source reference."""
+    _review_panel(html.escape(formatted), empty_label="(Empty formatted text)")
 
 
 @st.dialog("Confirm Verify All", width="small")
@@ -404,15 +412,15 @@ def review_popup(session_prefix):
         st.session_state[maker_key] = item["manufacturer"]
     edit_text_key = f"editable_{session_prefix}_{position}"
     edit_maker_key = f"editablemaker_{session_prefix}_{position}"
-    left, right = st.columns(2, gap="medium")
+    left, right = st.columns([1, 1], gap="medium", vertical_alignment="top")
     with left:
-        st.markdown("**Original text (reference — selectable, not editable)**")
+        st.markdown("**Original text** · :gray[Read-only / selectable]")
         active_draft = (st.session_state.get(edit_text_key, st.session_state[text_key])
                         if item["editing"] else st.session_state[text_key])
         colored_reference(item["source"], active_draft)
         st.caption("Red = source line not found in the formatted text (check before approval).")
     with right:
-        st.markdown("**Formatted text**")
+        st.markdown("**Formatted text** · :gray[" + ("Editing" if item["editing"] else "Preview") + "]")
         if item["editing"]:
             # Separate widget keys prevent Streamlit from resetting the stored
             # draft when switching a read-only code block into an editor.
@@ -420,10 +428,11 @@ def review_popup(session_prefix):
                 st.session_state[edit_text_key] = st.session_state[text_key]
             if edit_maker_key not in st.session_state:
                 st.session_state[edit_maker_key] = st.session_state[maker_key]
-            st.text_area("Formatted Internal Note", height=390, key=edit_text_key)
+            st.text_area("Formatted Internal Note", height=REVIEW_PANEL_HEIGHT, key=edit_text_key,
+                         label_visibility="collapsed")
             st.text_input("Manufacturer", key=edit_maker_key)
         else:
-            st.code(st.session_state[text_key] or "(Empty formatted text)", language=None, wrap_lines=True)
+            formatted_reference(st.session_state[text_key])
             st.caption("Manufacturer: " + (st.session_state[maker_key] or "(Not identified)"))
     if not item["source"]:
         st.info("This item has an empty source note. Verify it if the blank note is intentional.")
