@@ -77,7 +77,8 @@ SECTION_PATTERNS = {
 }
 SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
-META_LINES = {"mpn details"}
+META_LINES = set()
+FOLLOWED_BY_DATA_LABELS = {"tag nos", "tag numbers", "mpn details"}
 PRESERVED_LABELS = {"characteristics"}
 # Narrative subsection titles must not be mistaken for blank attribute fields.
 NARRATIVE_HEADING_PATTERN = re.compile(
@@ -86,13 +87,18 @@ NARRATIVE_HEADING_PATTERN = re.compile(
 )
 
 
-def is_empty_field(line):
+def is_empty_field(line, next_nonempty=""):
     """Drop only genuinely empty attribute fields; preserve prose and technical values."""
     line = line.strip()
     if not line:
         return True
     if line.casefold() in META_LINES:
         return True
+    # Section subheadings can introduce values on subsequent lines.
+    # Keep them only when meaningful following content exists.
+    normalized_heading = line.rstrip(": \t").strip().casefold()
+    if normalized_heading in FOLLOWED_BY_DATA_LABELS and next_nonempty and not match_section(next_nonempty):
+        return False
     if ":" in line:
         left, right = line.split(":", 1)
         # Empty field label, including extraction placeholders.
@@ -143,14 +149,15 @@ def format_rfq_python(text):
     sections = {name: [] for name in SECTION_ORDER}
     active = "Basic Data Text"
     original_lines = [line.strip() for line in raw.split("\n")]
-    for line in original_lines:
+    for idx, line in enumerate(original_lines):
+        next_nonempty = next((x for x in original_lines[idx + 1:] if x.strip()), "")
         if not line:
             continue
         header = match_section(line)
         if header:
             active = header
             continue
-        if is_empty_field(line):
+        if is_empty_field(line, next_nonempty):
             continue
         sections[active].append(line)
 
