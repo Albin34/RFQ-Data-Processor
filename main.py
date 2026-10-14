@@ -186,21 +186,29 @@ def format_rfq_python(text):
             seen.add(line)
     sections["MPN Text"] = deduped
 
-    # Separate different manufacturer/part-number sets with a blank line.
-    # A new Manufacturer Part Number following an earlier manufacturer-number
-    # line begins another set; never change the original specification values.
+    # Keep each manufacturer and its corresponding part number together.
+    # Insert a blank line only when the previous pair is complete and a
+    # new manufacturer or part-number entry starts the next pair.
     mpn_lines = sections["MPN Text"]
     separated_mpn = []
-    previous_set_has_manufacturer = False
+    seen_part = False
+    seen_manufacturer = False
     for line in mpn_lines:
         is_part_number = bool(re.match(r"^Manufacturer\s+Part\s+Number\s*:", line, re.I))
         is_manufacturer_number = bool(re.match(r"^Manufacturer\s+number\s*:", line, re.I))
-        if is_part_number and previous_set_has_manufacturer and separated_mpn:
-            separated_mpn.append("")
-            previous_set_has_manufacturer = False
+        # The first entry of a subsequent pair is a repeated field type;
+        # the complementary field in the first pair should never be split.
+        begins_new_pair = (seen_part and seen_manufacturer and
+                           ((is_part_number and seen_part) or
+                            (is_manufacturer_number and seen_manufacturer)))
+        if begins_new_pair:
+            if separated_mpn and separated_mpn[-1] != "":
+                separated_mpn.append("")
+            seen_part = False
+            seen_manufacturer = False
         separated_mpn.append(line)
-        if is_manufacturer_number:
-            previous_set_has_manufacturer = True
+        seen_part = seen_part or is_part_number
+        seen_manufacturer = seen_manufacturer or is_manufacturer_number
     sections["MPN Text"] = separated_mpn
 
     chunks = []
