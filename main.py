@@ -222,7 +222,7 @@ def format_rfq_python(text):
             chunks.append(section + ":\n" + "\n".join(lines))
     # Always preserve relevant data, even when no headers were present.
     output = "\n\n".join(chunks)
-    return output, extract_manufacturers(raw)
+    return normalize_pdf_symbols(output), extract_manufacturers(raw)
 
 
 def process_rfq_text(text):
@@ -421,31 +421,74 @@ def resolve_template(uploaded, default_filename):
         raise FileNotFoundError(f"Missing default template: {path.name}. Please upload a template.")
     return path
 
-def format_tabular_pdf_note(note):
-    """Format the review draft for table-style PDFs without flattening fields.
+def normalize_pdf_symbols(value):
+    """Replace the exact unwanted token in generated PDF draft text only."""
+    text = str(value)
+    return text.replace("<(>&<)>", "&").replace("(>&<)", "&")
 
-    These PDFs often put one specification on each physical line, including
-    fields that were not anticipated by the original narrow field-name regex.
-    Preserve the supplied line breaks rather than guessing continuations.
-    The Uploading Sheet keeps the untouched extracted note separately.
+
+def join_pdf_wrapped_lines(note):
+    """Rejoin paragraph continuations without merging separate specifications.
+
+    Source lines remain unmodified for the Uploading Sheet and reference pane.
+    Uncertain standalone lines are deliberately preserved for manual review.
     """
+    lines = [normalize_pdf_symbols(line.strip()) for line in str(note).splitlines()]
+    field = re.compile(r"^[A-Z][A-Z0-9 /()_.-]{1,65}\s*:\s*\S", re.I)
+    heading = re.compile(r"^(?:BASIC DATA TEXT|CLASSIFICATION TEXT|MPN TEXT|INSPECTION TEXT|PO MATERIAL TEXT|MPN DETAILS|CHARACTERISTICS|TAG NOS)\s*:?$", re.I)
+    # Fields whose values commonly span multiple physical PDF lines.
+    paragraph_field = re.compile(r"^(?:ADDITIONAL INFORMATION|DESCRIPTION|REMARKS?|NOTES?|SCOPE OF WORK|SPECIAL INSTRUCTIONS?|DRAWING NUMBER)\s*:", re.I)
+    # A new attribute must begin on its own line, never appended to prose.
+    out = []
+    narrative = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            narrative = False
+            continue
+        if heading.fullmatch(line):
+            out.append(line)
+            narrative = False
+            continue
+        if field.match(line):
+            out.append(line)
+            narrative = bool(paragraph_field.match(line))
+            continue
+        # Wrapped prose continues an existing narrative value. For ordinary
+        # technical data, join only obvious wrap fragments, not new fields.
+        prev = out[-1] if out else ""
+        obvious_continuation = bool(prev and (
+            re.search(r"(?:,|;|\b(?:AND|OR|OF|TO|BUT|NOT|THE|FOR|WITH))\s*$", prev, re.I)
+            or re.match(r"^(?:SKETCH\b|\b(?:OF|AND|OR|BUT|NOT|EXCEEDING|PROVIDED)\b)", line, re.I)
+        ))
+        if prev and (narrative or obvious_continuation):
+            out[-1] = prev.rstrip() + " " + line
+        else:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def format_tabular_pdf_note(note):
+    """Readable PDF review draft; keep technical fields separate, join prose wraps."""
     physical = [line.strip() for line in str(note).splitlines() if line.strip()]
     if not physical:
         return "", ""
 
-    # Preserve every source line in its original sequence. Blank lines are
-    # added only to distinguish major groups, never inside specification values.
+    formatted = join_pdf_wrapped_lines(note)
+    # Group some related fields visually, without changing PDF upload text.
     output = []
     group_start = re.compile(
         r"^(?:MAKE|MODEL NUMBER OF EQUIPMENT|ADDITIONAL INFORMATION)\s*:", re.I
     )
-    for line in physical:
+    for line in formatted.splitlines():
         if output and group_start.match(line) and output[-1] != "":
             output.append("")
         output.append(line)
 
-    # Manufacturer extraction uses the same source lines, not the display
-    # grouping, and retains the previous host-equipment OEM preference.
+    # Continue extracting manufacturer from the original source text, avoiding
+    # inadvertent changes to manufacturer names from paragraph normalization.
     manufacturer = ""
     extra_index = next((i for i, line in enumerate(physical)
                         if re.match(r"^ADDITIONAL\s+INFORMATION\s*:", line, re.I)), None)
