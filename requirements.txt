@@ -8,3 +8,4 @@ xlrd
 tenacity
 protobuf==3.20.3
 streamlit>=1.55.0
+pymupdf
