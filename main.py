@@ -330,6 +330,93 @@ def parse_pdf(body, full_rfq_text):
                         "QTY":item[2], "UOM":item[3]})
     return results
 
+def summarize_nawah_working_note(raw):
+    """Nawah Working Sheet: technical PO text + short certificate obligations.
+
+    Full source stays in Uploading Sheet and in review reference panel.
+    """
+    source = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    source = re.sub(r"\*{4,}\s*;?\s*Material PO text\s*:\s*\*{4,}", "Material PO Text:", source, flags=re.I)
+    source = re.sub(r"^\s*\[Material PO Text\]\s*$", "Material PO Text:", source, flags=re.I | re.M)
+    cut = re.search(r"^\s*QUALITY REQUIREMENTS\s*:?\s*$", source, re.I | re.M)
+    material = (source[:cut.start()] if cut else source).strip()
+    material = re.sub(r"^\s*Material PO Text\s*:\s*", "", material, flags=re.I)
+    quality = source[cut.start():] if cut else ""
+    certificates = []
+    for pattern, label in [
+        (r"CERTIFICATE\s+OF\s+COMPLIANCE|CERTIFICATE\s+OF\s+CONFORMITY|CERTIFICATE\s+OF\s+CONFORMANCE|\bCOC\b", "CERTIFICATE OF COMPLIANCE"),
+        (r"MATERIAL\s+TEST\s+CERTIFICATE|\bMTC\b", "MATERIAL TEST CERTIFICATE"),
+        (r"CALIBRATION\s+CERTIFICATE|CERTIFICATE\s+OF\s+CALIBRATION", "CALIBRATION CERTIFICATE"),
+        (r"\bTEST\s+CERTIFICATE\b|\bTEST\s+REPORT\b", "TEST CERTIFICATE"),
+    ]:
+        if re.search(pattern, quality, re.I):
+            certificates.append(label)
+    # Explicit certificates listed in the technical item text are already preserved verbatim.
+    result = 'Material PO Text:\n\n' + material if material else 'Material PO Text:'
+    if certificates:
+        result += '\n\nQUALITY REQUIREMENTS\n\n' + '\n'.join(
+            c + ('\nA CERTIFICATE OF COMPLIANCE IS REQUIRED FOR THIS PURCHASE ORDER.' if c == 'CERTIFICATE OF COMPLIANCE' else '')
+            for c in dict.fromkeys(certificates))
+    return result, extract_manufacturers(material)
+
+
+def _nawah_excel_records(book, rfq_number):
+    """Find item rows in variable Nawah XLS sheets without Ariba column headers."""
+    records = []
+    for name in book.sheet_names:
+        frame = pd.read_excel(book, sheet_name=name, header=None, dtype=object, keep_default_na=False)
+        grid = [[_clean(v) for v in row] for row in frame.itertuples(index=False, name=None)]
+        for pos, cells in enumerate(grid):
+            # Every Nawah item has an item number, 9-digit material number,
+            # technical description, quantity, and UOM near each other.
+            candidates = [(i, v) for i, v in enumerate(cells) if re.fullmatch(r"\d{8,12}(?:\.0)?", v)]
+            for mat_col, mat_value in candidates:
+                left = [v for v in cells[max(0,mat_col-3):mat_col] if v]
+                item = next((v for v in reversed(left) if re.fullmatch(r"\d{1,4}(?:\.0)?", v)), None)
+                if not item: continue
+                after = cells[mat_col+1:]
+                desc = next((v for v in after if v and not re.fullmatch(r"[\d,.]+", v) and len(v)>8 and not re.fullmatch(r"[A-Za-z]{1,5}",v)), None)
+                if not desc: continue
+                quantity = ''; uom = ''
+                for i, val in enumerate(after):
+                    if re.fullmatch(r"[\d,]+(?:\.0+)?", val) and i+1<len(after) and re.fullmatch(r"(?:EA|PC|PCS|SET|M|KG|L|LOT|BOX|NOS|EACH)", after[i+1], re.I):
+                        quantity, uom = val, after[i+1]; break
+                if not quantity: continue
+                item_id = str(int(float(item)))
+                # Notes may occupy a merged cell or be split across subsequent rows.
+                fragments = []
+                for subsequent in grid[pos+1:]:
+                    flat = ' '.join(x for x in subsequent if x)
+                    if re.search(r"\bMaterial PO text\b|\bQUALITY REQUIREMENTS\b|\bCONTROL RELAY\b|\bMAGNETIC CONTACTOR\b", flat, re.I):
+                        pass
+                    if any(re.fullmatch(r"\d{8,12}(?:\.0)?", x) for x in subsequent): break
+                    if flat.strip():
+                        values = [x for x in subsequent if x]
+                        fragments.append(next((x for x in values if 'Material PO text' in x or 'QUALITY REQUIREMENTS' in x), '') or ('\n'.join(values) if any('\n' in x for x in values) else flat))
+                # Prefer multiline notes in cells; don't join word-wrapped cell paragraphs.
+                combined = '\n'.join(fragments)
+                if not re.search(r"Material PO text", combined, re.I):
+                    # Some XLS files put the PO text immediately after the item description.
+                    combined = '\n'.join(c for c in after if 'Material PO text' in c or 'QUALITY REQUIREMENTS' in c) + ('\n'+combined if combined else '')
+                if 'material po text' not in combined.lower() and '[material po text]' not in combined.lower():
+                    continue
+                records.append({'RFx Number':rfq_number, 'RFx Item No': item_id,
+                                'PR Item No':'', 'Material No':str(int(float(mat_value))),
+                                'Description': desc.split('\n')[0], 'PO Text':combined.strip(),
+                                'QTY':quantity, 'UOM':uom})
+    unique = {r['RFx Item No']:r for r in records}
+    return list(unique.values())
+
+
+def parse_nawah_rfq_excel(book, filename):
+    rfq = re.search(r"\d{10}", filename)
+    rfq_number = rfq.group(0) if rfq else 'Unknown'
+    # Prefer standard Nawah table columns where available.
+    records = _nawah_excel_records(book, rfq_number)
+    if records: return records
+    raise ValueError('Nawah XLS format detected but item rows were not identified. Please provide the worksheet headings and first item row for mapping.')
+
+
 def parse_nawah_rfq_pdf(pdf_file):
     """Parse NAWAH/ENEC item rows and preserve their per-item QA requirements.
 
@@ -590,7 +677,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
     for line, desc, qty, uom, note in records:
         formatted, manufacturer = (format_tabular_pdf_note(note)
                                    if format_style == "tabular_pdf"
-                                   else format_nawah_pdf_note(note) if format_style == "nawah_pdf"
+                                   else summarize_nawah_working_note(note) if format_style in ("nawah_pdf", "nawah_excel")
                                    else process_rfq_text(note))
         is_table = format_style == "tabular_pdf"
         # On this PDF layout the first line is the description. Show that full
@@ -879,36 +966,52 @@ with col1:
                 rfq_match = re.search(r"\d+", techno.name)
                 rfq_number = rfq_match.group() if rfq_match else "Unknown"
                 book = pd.ExcelFile(techno)
+                is_nawah_excel = False
+                # Ariba uses Description/InternalNote/Quantity/Unit of Measure.
+                # Nawah uses a different table layout and long PO text cells.
                 required = {"Description", "InternalNote", "Quantity", "Unit of Measure"}
                 matching = None
                 for name in book.sheet_names:
-                    if required.issubset(set(pd.read_excel(book, sheet_name=name, nrows=1).columns)):
+                    headings = set(map(str, pd.read_excel(book, sheet_name=name, nrows=1).columns))
+                    if required.issubset(headings):
                         matching = name
                         break
                 if matching is None:
-                    raise ValueError(f"No sheet contains the required columns: {', '.join(sorted(required))}")
-                df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
-                description = df["Description"].astype(str).str.strip().str.lower()
-                qty = df["Quantity"].astype(str).str.strip()
-                uom = df["Unit of Measure"].astype(str).str.strip()
-                valid = df[description.ne("item or lot description") & qty.ne("") & uom.ne("") & uom.str.lower().ne("unit of measure")]
-                if valid.empty:
-                    raise ValueError("No valid RFQ line items found")
-                upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
-                upload_sheet = upload_wb.active
-                clear_template_rows(upload_sheet)
-                records = []
-                for i, (_, rec) in enumerate(valid.iterrows()):
-                    line = (i+1)*10
-                    row = i+2
-                    values = {"A":rfq_number, "B":line, "E":rec["Description"],
-                              "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
-                              "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
-                    for c, value in values.items():
-                        upload_sheet[f"{c}{row}"] = value
-                    records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
+                    is_nawah_excel = True
+                    nawah_records = parse_nawah_rfq_excel(book, techno.name)
+                    upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+                    upload_sheet = upload_wb.active
+                    clear_template_rows(upload_sheet)
+                    records = []
+                    for i, rec in enumerate(nawah_records, 2):
+                        for col, val in {"A":rec['RFx Number'], "B":rec['RFx Item No'], "C":rec['PR Item No'],
+                                         "D":rec['Material No'], "E":rec['Description'], "F":rec['PO Text'],
+                                         "G":normalize_qty(rec['QTY']), "H":rec['UOM']}.items():
+                            upload_sheet[f"{col}{i}"] = val
+                        records.append((rec['RFx Item No'],rec['Description'],rec['QTY'],rec['UOM'],rec['PO Text']))
+                else:
+                    df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
+                    description = df["Description"].astype(str).str.strip().str.lower()
+                    qty = df["Quantity"].astype(str).str.strip()
+                    uom = df["Unit of Measure"].astype(str).str.strip()
+                    valid = df[description.ne("item or lot description") & qty.ne("") & uom.ne("") & uom.str.lower().ne("unit of measure")]
+                    if valid.empty:
+                        raise ValueError("No valid RFQ line items found")
+                    upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+                    upload_sheet = upload_wb.active
+                    clear_template_rows(upload_sheet)
+                    records = []
+                    for i, (_, rec) in enumerate(valid.iterrows()):
+                        line = (i+1)*10
+                        row = i+2
+                        values = {"A":rfq_number, "B":line, "E":rec["Description"],
+                                  "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
+                                  "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
+                        for c, value in values.items():
+                            upload_sheet[f"{c}{row}"] = value
+                        records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
                 wrap_all(upload_sheet)
-                prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb)
+                prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb, format_style="nawah_excel" if is_nawah_excel else "default")
                 st.success("Excel RFQ prepared for verification")
                 review_popup("excel")
             except Exception as exc:
