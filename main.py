@@ -330,6 +330,87 @@ def parse_pdf(body, full_rfq_text):
                         "QTY":item[2], "UOM":item[3]})
     return results
 
+def parse_nawah_rfq_pdf(pdf_file):
+    """Parse NAWAH/ENEC item rows and preserve their per-item QA requirements.
+
+    These RFQs put Material PO Text and extended QUALITY REQUIREMENTS below
+    each numbered item, including requirements continuing onto later pages.
+    The next numbered item, not a page break, closes the previous item.
+    """
+    if fitz is None:
+        raise RuntimeError("Nawah RFQ extraction requires PyMuPDF (pymupdf).")
+    pdf_file.seek(0)
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    try:
+        pages = [page.get_text("text", sort=True) for page in doc]
+    finally:
+        doc.close()
+    raw = "\n".join(pages)
+    if not (re.search(r"\bNAWAH\s+ENERGY\b|\bENEC\s+Operations\b", raw, re.I)
+            and re.search(r"\bMPN\s+NO\b", raw, re.I)
+            and re.search(r"\[Material\s+PO\s+Text\]", raw, re.I)):
+        return None
+    rfq_match = re.search(r"\bRFQ\s+NO\s+(\d{7,12})\b", raw, re.I)
+    rfq_number = rfq_match.group(1) if rfq_match else "Unknown"
+    # Header includes distinct text cells separated by multiple spaces.
+    # Match the item number and material id first; capture the last columns
+    # from the right so product model numbers can contain spaces and commas.
+    head = re.compile(
+        r"^\s*(\d{1,5})\s+(\d{7,12})\s+(.+?)\s{2,}(.+?)\s{2,}"
+        r"([\d,]+)\s+([A-Za-z]{1,8})\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s*$",
+        re.I)
+    page_header = re.compile(r"^\s*(?:VENDOR\s+90000000|\d+\s*/\s*\d+\s*$|RFQ\s+NO\s+\d+)" ,re.I)
+    entries = []
+    current = None
+    for page in pages:
+        for raw_line in page.splitlines():
+            line = raw_line.rstrip()
+            found = head.fullmatch(line)
+            if found:
+                item_no, material, description, mpn, quantity, uom, delivery = found.groups()
+                current = {"RFx Number":rfq_number, "RFx Item No":str(int(item_no)),
+                           "PR Item No":"", "Material No":material,
+                           "Description":description.strip(), "PO Text":"",
+                           "QTY":quantity, "UOM":uom, "MPN":mpn.strip(),
+                           "Delivery Date":delivery, "_lines":[], "_started":False}
+                entries.append(current)
+                continue
+            if current is None:
+                continue
+            if re.search(r"^\s*INSTRUCTION\s+TO\s+BIDDERS\s*$", line, re.I):
+                current = None
+                continue
+            if page_header.match(line):
+                continue
+            if not current["_started"]:
+                if re.match(r"^\s*\[Material\s+PO\s+Text\]\s*$", line, re.I):
+                    current["_started"] = True
+                    current["_lines"].append("Material PO Text:")
+                continue
+            stripped = line.strip()
+            if re.fullmatch(r"[.]+", stripped):
+                continue
+            current["_lines"].append(stripped)
+    records = []
+    for entry in entries:
+        entry["PO Text"] = "\n".join(entry.pop("_lines")).strip()
+        entry.pop("_started", None)
+        if not entry["PO Text"]:
+            raise ValueError(f"Nawah RFQ item {entry['RFx Item No']} has no Material PO Text")
+        records.append(entry)
+    if not records:
+        raise ValueError("Nawah layout detected but no complete item rows extracted")
+    return records
+
+
+def format_nawah_pdf_note(note):
+    """Keep long quality obligations verbatim; do not treat them as empty fields."""
+    raw = normalize_pdf_symbols(str(note).replace("\r\n", "\n")).strip()
+    # Preserve section breaks, messages, and numbered QA requirements; keep
+    # technical attributes on their own lines. Human reviewer controls changes.
+    return raw, extract_manufacturers(raw)
+
+
 def parse_tabular_rfq_pdf(pdf_file):
     """Extract Fertil RFQ table rows, including continuation text across pages.
 
@@ -509,6 +590,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
     for line, desc, qty, uom, note in records:
         formatted, manufacturer = (format_tabular_pdf_note(note)
                                    if format_style == "tabular_pdf"
+                                   else format_nawah_pdf_note(note) if format_style == "nawah_pdf"
                                    else process_rfq_text(note))
         is_table = format_style == "tabular_pdf"
         # On this PDF layout the first line is the description. Show that full
@@ -853,8 +935,11 @@ with col2:
             try:
                 # First handle table-based RFQs (description embedded in first line).
                 # Fallback retains support for older Ariba-style PDF layouts.
-                data = parse_tabular_rfq_pdf(pdf)
-                is_tabular_pdf = data is not None
+                data = parse_nawah_rfq_pdf(pdf)
+                is_nawah_pdf = data is not None
+                if data is None:
+                    data = parse_tabular_rfq_pdf(pdf)
+                is_tabular_pdf = data is not None and not is_nawah_pdf
                 if data is None:
                     pdf.seek(0)
                     full = pdf_text(pdf)
@@ -875,7 +960,7 @@ with col2:
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
                 prepare_review(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb,
-                               format_style="tabular_pdf" if is_tabular_pdf else "default")
+                               format_style="nawah_pdf" if is_nawah_pdf else "tabular_pdf" if is_tabular_pdf else "default")
                 st.success("PDF RFQ prepared for verification")
                 review_popup("pdf")
             except Exception as exc:
