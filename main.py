@@ -14,6 +14,10 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from PyPDF2 import PdfReader
+try:
+    import fitz  # PyMuPDF: layout-aware extraction for tabular RFQ PDFs
+except ImportError:
+    fitz = None
 
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
@@ -259,13 +263,143 @@ def parse_pdf(body, full_rfq_text):
                         "PO Text":pos[i] if i<len(pos) else "", "QTY":item[2], "UOM":item[3]})
     return results
 
+def parse_tabular_rfq_pdf(pdf_file):
+    """Parse Fertil-style RFQ table via word coordinates, preserving PDF line breaks.
+
+    Each line item has columns S No, PR Number, PR item #, Material / Service #,
+    Description (first line is the short description), Quantity Requested and UOM.
+    Return None for PDFs that do not match the layout, so legacy parsing remains.
+    """
+    if fitz is None:
+        raise RuntimeError("PDF table support requires PyMuPDF. Add pymupdf to requirements.txt.")
+    pdf_file.seek(0)
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    all_items = []
+    found_layout = False
+    rfq_number = ""
+    try:
+        for page in doc:
+            lines = page.get_text("text")
+            if not rfq_number:
+                match = re.search(r"RFQ\s*FORM\s*\n\s*(\d{8,})", lines, re.I)
+                if match:
+                    rfq_number = match.group(1)
+            # Detect actual table columns via header token coordinates.
+            words = page.get_text("words", sort=True)
+            header_y = None
+            for w in words:
+                if w[4].lower() == "description" and 180 < w[0] < 450:
+                    header_y = w[1]
+                    break
+            if header_y is None:
+                continue
+            found_layout = True
+            # The source layout places item description at x≈192, quantity at x≈405.
+            # Determine rows from the S No column (x 0–35), not arbitrary text.
+            row_heads = []
+            for w in words:
+                word = str(w[4])
+                if w[1] > header_y + 8 and 0 <= w[0] < 35 and re.fullmatch(r"\d{1,3}", word):
+                    row_heads.append((w[1], int(word)))
+            row_heads.sort()
+            if not row_heads:
+                continue
+            page_bottom = page.rect.height - 30
+            for idx, (top_y, sequence) in enumerate(row_heads):
+                lower_y = row_heads[idx+1][0] - 1 if idx + 1 < len(row_heads) else page_bottom
+                row_words = [w for w in words if top_y-2 <= w[1] < lower_y]
+                cols = {"pr":[], "pr_item":[], "material":[], "description":[], "quantity":[], "uom":[]}
+                for w in row_words:
+                    x = w[0]
+                    if 35 <= x < 85: col="pr"
+                    elif 85 <= x < 119: col="pr_item"
+                    elif 119 <= x < 190: col="material"
+                    elif 190 <= x < 400: col="description"
+                    elif 400 <= x < 445: col="quantity"
+                    elif 445 <= x < 490: col="uom"
+                    else: continue
+                    cols[col].append(w)
+                def text_of(col):
+                    return " ".join(str(w[4]) for w in sorted(cols[col],key=lambda w:(round(w[1],1),w[0]))).strip()
+                def physical_lines(ws):
+                    rows=[]
+                    for word in sorted(ws,key=lambda w:(w[1],w[0])):
+                        if not rows or abs(word[1]-rows[-1][0]) > 2.5:
+                            rows.append((word[1],[word]))
+                        else:
+                            rows[-1][1].append(word)
+                    return [" ".join(str(w[4]) for w in sorted(group,key=lambda w:w[0])).strip()
+                            for _,group in rows]
+                description_lines = physical_lines(cols["description"])
+                if not description_lines:
+                    continue
+                pr_item = text_of("pr_item")
+                material = text_of("material")
+                qty = text_of("quantity")
+                uom = text_of("uom")
+                if not (re.fullmatch(r"\d{4,6}",pr_item) and re.fullmatch(r"\d{6,}",material) and qty and uom):
+                    continue
+                note = "\n".join(description_lines[1:])
+                # Avoid altering explicit source line breaks; no flattening here.
+                all_items.append({"RFx Number":rfq_number, "RFx Item No":str(int(pr_item)),
+                                  "PR Item No":pr_item, "Material No":material,
+                                  "Description":description_lines[0], "PO Text":note,
+                                  "QTY":qty, "UOM":uom})
+    finally:
+        doc.close()
+    if not found_layout:
+        return None
+    if not all_items:
+        raise ValueError("Tabular RFQ layout detected but no complete rows extracted; review PDF text positions.")
+    return all_items
+
 def resolve_template(uploaded, default_filename):
     path = uploaded if uploaded is not None else Path(__file__).with_name(default_filename)
     if isinstance(path, Path) and not path.is_file():
         raise FileNotFoundError(f"Missing default template: {path.name}. Please upload a template.")
     return path
 
-def prepare_review(records, template, suffix, session_prefix, upload_wb=None):
+def format_tabular_pdf_note(note):
+    """Combine PDF visual wraps into readable technical fields without paraphrasing.
+
+    The original multiline PO Text is written unchanged to the Uploading Sheet;
+    this separately constructs the editable Working Sheet review draft.
+    """
+    physical = [line.strip() for line in str(note).splitlines() if line.strip()]
+    if not physical:
+        return "", ""
+    # Start of a new specification/technical field. Preserve text of its value.
+    field_head = re.compile(
+        r"^(?:EQUIPMENT\s+TYPE|MAKE|MANUFACTURER\s+PART\s+NUMBER|"
+        r"MODEL\s+NUMBER\s+OF\s+EQUIPMENT|DRAWING\s+NUMBER|"
+        r"ADDITIONAL\s+INFORMATION|POSITION\s+NUMBER|ITEM\s+TYPE)\s*:", re.I)
+    logical = []
+    for line in physical:
+        if not logical or field_head.match(line):
+            logical.append(line)
+        else:
+            # Continuation of a visually wrapped PDF table cell.
+            logical[-1] += " " + line
+    # Spacing follows the supplied Working Sheet example without dropping facts.
+    output = []
+    for i, line in enumerate(logical):
+        if i and re.match(r"^(?:MAKE|MODEL NUMBER OF EQUIPMENT|ADDITIONAL INFORMATION)\s*:",line,re.I):
+            output.append("")
+        output.append(line)
+    # In this style, equipment MAKE is BOLLFILTER, while the additional
+    # information may name the OEM of the host pump (EBARA). The sample Working
+    # Sheet chooses that latter company in the Manufacturer column.
+    manufacturer = ""
+    extra = next((line for line in logical if re.match(r"^ADDITIONAL\s+INFORMATION\s*:", line, re.I)), "")
+    if extra:
+        match = re.search(r"\bMAKE\s*:\s*(.*?)(?=,\s*(?:MODEL|SERIAL|TAG)\s*:?|$)",extra,re.I)
+        if match:
+            manufacturer = match.group(1).strip().strip(", ")
+    if not manufacturer:
+        manufacturer = extract_manufacturers("\n".join(logical))
+    return "\n".join(output), manufacturer
+
+def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
     if not records:
         raise ValueError("No RFQ items to process")
@@ -274,7 +408,9 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None):
     template_data = workbook_bytes(template_wb)
     queue = []
     for line, desc, qty, uom, note in records:
-        formatted, manufacturer = process_rfq_text(note)
+        formatted, manufacturer = (format_tabular_pdf_note(note)
+                                   if format_style == "tabular_pdf"
+                                   else process_rfq_text(note))
         queue.append({"line": line, "desc": desc, "qty": qty, "uom": uom,
                       "source": _clean(note), "formatted": formatted,
                       "manufacturer": manufacturer, "verified": False, "editing": False})
@@ -590,9 +726,15 @@ with col2:
             st.warning("Upload an RFQ PDF and enter HTS number")
         else:
             try:
-                full = pdf_text(pdf)
-                body = re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)", "", full)
-                data = parse_pdf(body, full)
+                # First handle table-based RFQs (description embedded in first line).
+                # Fallback retains support for older Ariba-style PDF layouts.
+                data = parse_tabular_rfq_pdf(pdf)
+                is_tabular_pdf = data is not None
+                if data is None:
+                    pdf.seek(0)
+                    full = pdf_text(pdf)
+                    body = re.sub(r"(REQUEST FOR QUOTATION[\s\S]*?RFQ Number \d+)", "", full)
+                    data = parse_pdf(body, full)
                 if not data:
                     raise ValueError("No RFQ items parsed. The PDF may not match the supported RFQ layout or may be scanned.")
                 upload_wb = load_workbook(resolve_template(hts_tpl, "upload file - HTS.xlsx"))
@@ -607,7 +749,8 @@ with col2:
                         sheet[f"{col}{i}"] = normalize_qty(item[field]) if field == "QTY" else item[field]
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
-                prepare_review(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb)
+                prepare_review(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb,
+                               format_style="tabular_pdf" if is_tabular_pdf else "default")
                 st.success("PDF RFQ prepared for verification")
                 review_popup("pdf")
             except Exception as exc:
