@@ -321,99 +321,89 @@ def parse_pdf(body, full_rfq_text):
     return results
 
 def parse_tabular_rfq_pdf(pdf_file):
-    """Parse Fertil-style RFQ table via word coordinates, preserving PDF line breaks.
+    """Extract Fertil RFQ table rows, including continuation text across pages.
 
-    Each line item has columns S No, PR Number, PR item #, Material / Service #,
-    Description (first line is the short description), Quantity Requested and UOM.
-    Return None for PDFs that do not match the layout, so legacy parsing remains.
+    The first text line of a numbered row is its description. Remaining physical
+    PDF lines are the unmodified PO Text. Pages without any new item number can
+    still contribute continuation text to the preceding item.
     """
     if fitz is None:
         raise RuntimeError("PDF table support requires PyMuPDF. Add pymupdf to requirements.txt.")
     pdf_file.seek(0)
     doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
     all_items = []
-    found_layout = False
+    layout_seen = False
     rfq_number = ""
+
+    def physical_lines(words):
+        rows = []
+        for word in sorted(words, key=lambda w: (w[1], w[0])):
+            if not rows or abs(word[1] - rows[-1][0]) > 2.5:
+                rows.append((word[1], [word]))
+            else:
+                rows[-1][1].append(word)
+        return [" ".join(str(w[4]) for w in sorted(group, key=lambda w: w[0])).strip()
+                for _, group in rows]
+
+    def column_words(words, x_low, x_high, top, bottom):
+        return [w for w in words if x_low <= w[0] < x_high and top <= w[1] < bottom]
+
     try:
         for page in doc:
-            lines = page.get_text("text")
+            page_text = page.get_text("text")
             if not rfq_number:
-                match = re.search(r"RFQ\s*FORM\s*\n\s*(\d{8,})", lines, re.I)
-                if match:
-                    rfq_number = match.group(1)
-            # Only accept the Fertil RFQ FORM layout. ADNOC's Material Number /
-            # Description table uses very different columns and item markers.
-            if not (re.search(r"\bRFQ\s+FORM\b", lines, re.I)
-                    and "PR item" in lines and "Quantity" in lines):
+                m = re.search(r"RFQ\s*FORM(?:\s*Page\s+\d+\s*/\s*\d+)?\s*(\d{8,})", page_text, re.I)
+                if m:
+                    rfq_number = m.group(1)
+            # Important: do not confuse ADNOC's unrelated table with Fertil.
+            if not (re.search(r"\bRFQ\s+FORM\b", page_text, re.I)
+                    and rfq_number):
                 continue
             words = page.get_text("words", sort=True)
-            header_y = None
-            for w in words:
-                if w[4].lower() == "description" and 180 < w[0] < 450:
-                    header_y = w[1]
-                    break
-            if header_y is None:
+            headers = [w for w in words if str(w[4]).lower() == "description"
+                       and 190 < w[0] < 400 and w[1] < 380]
+            header_y = min((w[1] for w in headers), default=None)
+            # Fertil's first page has a cover block and table starting ~350;
+            # continuation pages have table at y~86, sometimes no header.
+            if header_y is not None:
+                text_top = header_y + 8
+                layout_seen = True
+            elif layout_seen:
+                text_top = 88
+            else:
                 continue
-            found_layout = True
-            # The source layout places item description at x≈192, quantity at x≈405.
-            # Determine rows from the S No column (x 0–35), not arbitrary text.
-            row_heads = []
-            for w in words:
-                word = str(w[4])
-                if w[1] > header_y + 8 and 0 <= w[0] < 35 and re.fullmatch(r"\d{1,3}", word):
-                    row_heads.append((w[1], int(word)))
-            row_heads.sort()
-            if not row_heads:
-                continue
-            page_bottom = page.rect.height - 30
+            bottom = page.rect.height - 30
+            row_heads = sorted([(w[1], int(str(w[4]))) for w in words
+                                if text_top <= w[1] < bottom and 0 <= w[0] < 35
+                                and re.fullmatch(r"\d{1,3}", str(w[4]))], key=lambda x: x[0])
+            # A partial row may occupy the top of a new page BEFORE a new item.
+            first_y = row_heads[0][0] if row_heads else bottom
+            continuation = physical_lines(column_words(words, 190, 400, text_top, first_y - 1))
+            if continuation and all_items:
+                previous = all_items[-1]
+                previous["PO Text"] = (previous["PO Text"].rstrip() + "\n" + "\n".join(continuation)).strip()
+
             for idx, (top_y, sequence) in enumerate(row_heads):
-                lower_y = row_heads[idx+1][0] - 1 if idx + 1 < len(row_heads) else page_bottom
-                row_words = [w for w in words if top_y-2 <= w[1] < lower_y]
-                cols = {"pr":[], "pr_item":[], "material":[], "description":[], "quantity":[], "uom":[]}
-                for w in row_words:
-                    x = w[0]
-                    if 35 <= x < 85: col="pr"
-                    elif 85 <= x < 119: col="pr_item"
-                    elif 119 <= x < 190: col="material"
-                    elif 190 <= x < 400: col="description"
-                    elif 400 <= x < 445: col="quantity"
-                    elif 445 <= x < 490: col="uom"
-                    else: continue
-                    cols[col].append(w)
-                def text_of(col):
-                    return " ".join(str(w[4]) for w in sorted(cols[col],key=lambda w:(round(w[1],1),w[0]))).strip()
-                def physical_lines(ws):
-                    rows=[]
-                    for word in sorted(ws,key=lambda w:(w[1],w[0])):
-                        if not rows or abs(word[1]-rows[-1][0]) > 2.5:
-                            rows.append((word[1],[word]))
-                        else:
-                            rows[-1][1].append(word)
-                    return [" ".join(str(w[4]) for w in sorted(group,key=lambda w:w[0])).strip()
-                            for _,group in rows]
-                description_lines = physical_lines(cols["description"])
+                lower_y = row_heads[idx + 1][0] - 1 if idx + 1 < len(row_heads) else bottom
+                row_words = [w for w in words if top_y - 2 <= w[1] < lower_y]
+                pr_item = " ".join(w[4] for w in column_words(row_words, 85, 119, top_y - 2, lower_y)).strip()
+                material = " ".join(w[4] for w in column_words(row_words, 119, 190, top_y - 2, lower_y)).strip()
+                qty = " ".join(w[4] for w in column_words(row_words, 400, 445, top_y - 2, lower_y)).strip()
+                uom = " ".join(w[4] for w in column_words(row_words, 445, 490, top_y - 2, lower_y)).strip()
+                description_lines = physical_lines(column_words(row_words, 190, 400, top_y - 2, lower_y))
                 if not description_lines:
                     continue
-                pr_item = text_of("pr_item")
-                material = text_of("material")
-                qty = text_of("quantity")
-                uom = text_of("uom")
-                if not (re.fullmatch(r"\d{4,6}",pr_item) and re.fullmatch(r"\d{6,}",material) and qty and uom):
+                if not (re.fullmatch(r"\d{4,6}", pr_item) and re.fullmatch(r"\d{6,}", material)
+                        and re.fullmatch(r"[\d,.]+", qty) and re.fullmatch(r"[A-Za-z]{1,8}", uom)):
                     continue
-                note = "\n".join(description_lines[1:])
-                # Avoid altering explicit source line breaks; no flattening here.
-                all_items.append({"RFx Number":rfq_number, "RFx Item No":str(int(pr_item)),
-                                  "PR Item No":pr_item, "Material No":material,
-                                  "Description":description_lines[0], "PO Text":note,
-                                  "QTY":qty, "UOM":uom})
+                all_items.append({"RFx Number": rfq_number, "RFx Item No": str(int(pr_item)),
+                                  "PR Item No": pr_item, "Material No": material,
+                                  "Description": description_lines[0],
+                                  "PO Text": "\n".join(description_lines[1:]),
+                                  "QTY": qty, "UOM": uom})
     finally:
         doc.close()
-    if not found_layout:
-        return None
-    if not all_items:
-        # Do not abort other PDF layouts if coordinate extraction did not match.
-        return None
-    return all_items
+    return all_items if all_items else None
 
 def resolve_template(uploaded, default_filename):
     path = uploaded if uploaded is not None else Path(__file__).with_name(default_filename)
@@ -428,47 +418,35 @@ def normalize_pdf_symbols(value):
 
 
 def join_pdf_wrapped_lines(note):
-    """Rejoin paragraph continuations without merging separate specifications.
+    """Join wrapped narrative values, retaining one line per named attribute.
 
-    Source lines remain unmodified for the Uploading Sheet and reference pane.
-    Uncertain standalone lines are deliberately preserved for manual review.
+    Never silently rewrite a technical value. In particular, broken words such
+    as 'MA' + 'TERIAL' remain explicit for human verification unless the split
+    is unambiguous and configured separately.
     """
     lines = [normalize_pdf_symbols(line.strip()) for line in str(note).splitlines()]
-    field = re.compile(r"^[A-Z][A-Z0-9 /()_.-]{1,65}\s*:\s*\S", re.I)
     heading = re.compile(r"^(?:BASIC DATA TEXT|CLASSIFICATION TEXT|MPN TEXT|INSPECTION TEXT|PO MATERIAL TEXT|MPN DETAILS|CHARACTERISTICS|TAG NOS)\s*:?$", re.I)
-    # Fields whose values commonly span multiple physical PDF lines.
-    paragraph_field = re.compile(r"^(?:ADDITIONAL INFORMATION|DESCRIPTION|REMARKS?|NOTES?|SCOPE OF WORK|SPECIAL INSTRUCTIONS?|DRAWING NUMBER)\s*:", re.I)
-    # A new attribute must begin on its own line, never appended to prose.
+    attribute = re.compile(r"^[A-Z][A-Z0-9 /()_.#-]{1,70}\s*:\s*\S", re.I)
+    narrative_label = re.compile(
+        r"^(?:ADDITIONAL INFORMATION(?:\s*\(CONTD\d+\))?|PRE-QUOTE\d*|PRE-SHIPMENT\d*|PRE-ORDER CONDITION\d*|STANDARD|SPECIFICATION|REMARKS?|NOTES?|DRAWING NUMBER|HARDNESS)\s*:", re.I)
     out = []
-    narrative = False
-    for raw in lines:
-        line = raw.strip()
+    joining = False
+    for line in lines:
         if not line:
             if out and out[-1] != "":
                 out.append("")
-            narrative = False
-            continue
-        if heading.fullmatch(line):
+            joining = False
+        elif heading.fullmatch(line):
             out.append(line)
-            narrative = False
-            continue
-        if field.match(line):
+            joining = False
+        elif attribute.match(line):
             out.append(line)
-            narrative = bool(paragraph_field.match(line))
-            continue
-        # Wrapped prose continues an existing narrative value. For ordinary
-        # technical data, join only obvious wrap fragments, not new fields.
-        prev = out[-1] if out else ""
-        obvious_continuation = bool(prev and (
-            re.search(r"(?:,|;|\b(?:AND|OR|OF|TO|BUT|NOT|THE|FOR|WITH))\s*$", prev, re.I)
-            or re.match(r"^(?:SKETCH\b|\b(?:OF|AND|OR|BUT|NOT|EXCEEDING|PROVIDED)\b)", line, re.I)
-        ))
-        if prev and (narrative or obvious_continuation):
-            out[-1] = prev.rstrip() + " " + line
+            joining = bool(narrative_label.match(line))
+        elif out and out[-1] and joining:
+            out[-1] = out[-1].rstrip() + " " + line
         else:
             out.append(line)
     return "\n".join(out).strip()
-
 
 def format_tabular_pdf_note(note):
     """Readable PDF review draft; keep technical fields separate, join prose wraps."""
