@@ -331,32 +331,56 @@ def parse_pdf(body, full_rfq_text):
     return results
 
 def summarize_nawah_working_note(raw):
-    """Nawah Working Sheet: technical PO text + short certificate obligations.
+    """Preserve Nawah material details and concisely list explicit QA deliverables.
 
-    Full source stays in Uploading Sheet and in review reference panel.
+    General commercial QA/packaging boilerplate is omitted from Working Sheet,
+    but nuclear safety status and code documents are not silently discarded.
+    The unmodified original remains in the Uploading Sheet/review reference.
     """
     source = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
-    source = re.sub(r"\*{4,}\s*;?\s*Material PO text\s*:\s*\*{4,}", "Material PO Text:", source, flags=re.I)
-    source = re.sub(r"^\s*\[Material PO Text\]\s*$", "Material PO Text:", source, flags=re.I | re.M)
-    cut = re.search(r"^\s*QUALITY REQUIREMENTS\s*:?\s*$", source, re.I | re.M)
+    source = re.sub(r"\*{4,}\s*;?\s*Material PO text\s*:\s*\*{4,}",
+                    "Material PO Text:", source, flags=re.I)
+    source = re.sub(r"^\s*\[Material PO Text\]\s*$", "Material PO Text:",
+                    source, flags=re.I | re.M)
+    # Some Nawah RFQs omit the literal QUALITY REQUIREMENTS header and
+    # begin directly with their first START OF MESSAGE CODE.
+    cut = re.search(
+        r"^\s*(?:QUALITY REQUIREMENTS?\s*:?\s*|START OF MESSAGE CODE\s+Z_NPE_[^\n]+)\s*$",
+        source, re.I | re.M)
+    if cut is None:
+        marker = re.search(r"^\s*\*{8,}\s*$\n\s*START OF MESSAGE CODE", source, re.I | re.M)
+        if marker:
+            cut = marker
     material = (source[:cut.start()] if cut else source).strip()
     material = re.sub(r"^\s*Material PO Text\s*:\s*", "", material, flags=re.I)
     quality = source[cut.start():] if cut else ""
-    certificates = []
-    for pattern, label in [
-        (r"CERTIFICATE\s+OF\s+COMPLIANCE|CERTIFICATE\s+OF\s+CONFORMITY|CERTIFICATE\s+OF\s+CONFORMANCE|\bCOC\b", "CERTIFICATE OF COMPLIANCE"),
-        (r"MATERIAL\s+TEST\s+CERTIFICATE|\bMTC\b", "MATERIAL TEST CERTIFICATE"),
-        (r"CALIBRATION\s+CERTIFICATE|CERTIFICATE\s+OF\s+CALIBRATION", "CALIBRATION CERTIFICATE"),
-        (r"\bTEST\s+CERTIFICATE\b|\bTEST\s+REPORT\b", "TEST CERTIFICATE"),
-    ]:
-        if re.search(pattern, quality, re.I):
-            certificates.append(label)
-    # Explicit certificates listed in the technical item text are already preserved verbatim.
-    result = 'Material PO Text:\n\n' + material if material else 'Material PO Text:'
-    if certificates:
-        result += '\n\nQUALITY REQUIREMENTS\n\n' + '\n'.join(
-            c + ('\nA CERTIFICATE OF COMPLIANCE IS REQUIRED FOR THIS PURCHASE ORDER.' if c == 'CERTIFICATE OF COMPLIANCE' else '')
-            for c in dict.fromkeys(certificates))
+
+    # Do not infer a certificate from generic boilerplate mentions such as
+    # traceability of sub-tier certifications. Detect explicit named requirements.
+    definitions = [
+        (r"Z_NPE_CERT OF CONFORMANCE|^\s*CERTIFICATE OF CONFORMANCE\s*$", "CERTIFICATE OF CONFORMANCE"),
+        (r"Z_NPE_CERT OF COMPLIANCE|^\s*CERTIFICATE OF COMPLIANCE\s*$", "CERTIFICATE OF COMPLIANCE"),
+        (r"Z_NPE_CERT OF CONFORMITY|^\s*CERTIFICATE OF CONFORMITY\s*$", "CERTIFICATE OF CONFORMITY"),
+        (r"Z_NPE_CODE CMTR|CODE CERTIFIED MATERIAL TEST REPORT", "CERTIFIED MATERIAL TEST REPORT (CMTR)"),
+        (r"Z_NPE_CMTR|MATERIAL TEST REPORT \(MTR\) REQUIREMENTS", "MATERIAL TEST REPORT (MTR)"),
+        (r"Z_NPE_CODE DATA REPORT|^\s*CODE DATA REPORT\s*$", "CODE DATA REPORT"),
+        (r"Z_NPE_CODE RECONCILIATION|CODE RECONCILIATION REQUIREMENTS", "CODE RECONCILIATION (IF REQUIRED)"),
+        (r"CALIBRATION CERTIFICATE|CERTIFICATE OF CALIBRATION", "CALIBRATION CERTIFICATE"),
+        (r"MATERIAL TEST CERTIFICATE|\bMTC\b", "MATERIAL TEST CERTIFICATE"),
+        (r"\bTEST CERTIFICATE\b", "TEST CERTIFICATE"),
+    ]
+    certificates = [label for pattern, label in definitions if re.search(pattern, quality, re.I | re.M)]
+    nuclear_safety = bool(re.search(r"Z_NPE_QA\s+SR\s+MATERIAL|\bNUCLEAR SAFETY RELATED\b", quality, re.I))
+    packing_slip = bool(re.search(r"Packing Slip or Equivalent Commercial Certification is required", quality, re.I))
+    clauses = []
+    if nuclear_safety:
+        clauses.append("NUCLEAR SAFETY-RELATED MATERIAL: NAWAH-approved nuclear QA requirements apply; review full source requirements.")
+    if packing_slip:
+        clauses.append("PACKING SLIP OR EQUIVALENT COMMERCIAL CERTIFICATION REQUIRED.")
+    clauses.extend(dict.fromkeys(certificates))
+    result = "Material PO Text:\n\n" + material if material else "Material PO Text:"
+    if clauses:
+        result += "\n\nQUALITY REQUIREMENTS\n\n" + "\n".join(clauses)
     return result, extract_manufacturers(material)
 
 
