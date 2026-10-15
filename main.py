@@ -422,44 +422,50 @@ def resolve_template(uploaded, default_filename):
     return path
 
 def format_tabular_pdf_note(note):
-    """Combine PDF visual wraps into readable technical fields without paraphrasing.
+    """Format the review draft for table-style PDFs without flattening fields.
 
-    The original multiline PO Text is written unchanged to the Uploading Sheet;
-    this separately constructs the editable Working Sheet review draft.
+    These PDFs often put one specification on each physical line, including
+    fields that were not anticipated by the original narrow field-name regex.
+    Preserve the supplied line breaks rather than guessing continuations.
+    The Uploading Sheet keeps the untouched extracted note separately.
     """
     physical = [line.strip() for line in str(note).splitlines() if line.strip()]
     if not physical:
         return "", ""
-    # Start of a new specification/technical field. Preserve text of its value.
-    field_head = re.compile(
-        r"^(?:EQUIPMENT\s+TYPE|MAKE|MANUFACTURER\s+PART\s+NUMBER|"
-        r"MODEL\s+NUMBER\s+OF\s+EQUIPMENT|DRAWING\s+NUMBER|"
-        r"ADDITIONAL\s+INFORMATION|POSITION\s+NUMBER|ITEM\s+TYPE)\s*:", re.I)
-    logical = []
-    for line in physical:
-        if not logical or field_head.match(line):
-            logical.append(line)
-        else:
-            # Continuation of a visually wrapped PDF table cell.
-            logical[-1] += " " + line
-    # Spacing follows the supplied Working Sheet example without dropping facts.
+
+    # Preserve every source line in its original sequence. Blank lines are
+    # added only to distinguish major groups, never inside specification values.
     output = []
-    for i, line in enumerate(logical):
-        if i and re.match(r"^(?:MAKE|MODEL NUMBER OF EQUIPMENT|ADDITIONAL INFORMATION)\s*:",line,re.I):
+    group_start = re.compile(
+        r"^(?:MAKE|MODEL NUMBER OF EQUIPMENT|ADDITIONAL INFORMATION)\s*:", re.I
+    )
+    for line in physical:
+        if output and group_start.match(line) and output[-1] != "":
             output.append("")
         output.append(line)
-    # In this style, equipment MAKE is BOLLFILTER, while the additional
-    # information may name the OEM of the host pump (EBARA). The sample Working
-    # Sheet chooses that latter company in the Manufacturer column.
+
+    # Manufacturer extraction uses the same source lines, not the display
+    # grouping, and retains the previous host-equipment OEM preference.
     manufacturer = ""
-    extra = next((line for line in logical if re.match(r"^ADDITIONAL\s+INFORMATION\s*:", line, re.I)), "")
-    if extra:
-        match = re.search(r"\bMAKE\s*:\s*(.*?)(?=,\s*(?:MODEL|SERIAL|TAG)\s*:?|$)",extra,re.I)
+    extra_index = next((i for i, line in enumerate(physical)
+                        if re.match(r"^ADDITIONAL\s+INFORMATION\s*:", line, re.I)), None)
+    if extra_index is not None:
+        extra_lines = []
+        for line in physical[extra_index:]:
+            if extra_lines and re.match(
+                r"^(?:POSITION NUMBER|ITEM TYPE|DRAWING NUMBER|MANUFACTURER PART NUMBER)\s*:",
+                line, re.I
+            ):
+                break
+            extra_lines.append(line)
+        extra = " ".join(extra_lines)
+        match = re.search(r"\bMAKE\s*:\s*(.*?)(?=,\s*(?:MODEL|SERIAL|TAG)\s*:?|$)", extra, re.I)
         if match:
             manufacturer = match.group(1).strip().strip(", ")
     if not manufacturer:
-        manufacturer = extract_manufacturers("\n".join(logical))
+        manufacturer = extract_manufacturers("\n".join(physical))
     return "\n".join(output), manufacturer
+
 
 def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
