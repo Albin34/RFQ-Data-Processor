@@ -48,6 +48,16 @@ def normalize_qty(value):
     return value
 
 def workbook_bytes(workbook):
+    """Export workbooks using Aptos Narrow without changing other cell styles."""
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if cell.value is None and not cell.has_style:
+                    continue
+                current_font = copy(cell.font)
+                if current_font.name != "Aptos Narrow":
+                    current_font.name = "Aptos Narrow"
+                    cell.font = current_font
     buffer = BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
