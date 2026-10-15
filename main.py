@@ -361,52 +361,121 @@ def summarize_nawah_working_note(raw):
 
 
 def _nawah_excel_records(book, rfq_number):
-    """Find item rows in variable Nawah XLS sheets without Ariba column headers."""
+    """Read Nawah legacy XLS where tables and merged PO-text cells are not aligned.
+
+    Header values may be scattered across adjacent rows/columns.  Identify item
+    rows from material ids and neighboring quantities, then map full multi-line
+    Material PO Text cells in document order. Never guess a material number.
+    """
     records = []
     for name in book.sheet_names:
-        frame = pd.read_excel(book, sheet_name=name, header=None, dtype=object, keep_default_na=False)
-        grid = [[_clean(v) for v in row] for row in frame.itertuples(index=False, name=None)]
-        for pos, cells in enumerate(grid):
-            # Every Nawah item has an item number, 9-digit material number,
-            # technical description, quantity, and UOM near each other.
-            candidates = [(i, v) for i, v in enumerate(cells) if re.fullmatch(r"\d{8,12}(?:\.0)?", v)]
-            for mat_col, mat_value in candidates:
-                left = [v for v in cells[max(0,mat_col-3):mat_col] if v]
-                item = next((v for v in reversed(left) if re.fullmatch(r"\d{1,4}(?:\.0)?", v)), None)
-                if not item: continue
-                after = cells[mat_col+1:]
-                desc = next((v for v in after if v and not re.fullmatch(r"[\d,.]+", v) and len(v)>8 and not re.fullmatch(r"[A-Za-z]{1,5}",v)), None)
-                if not desc: continue
-                quantity = ''; uom = ''
-                for i, val in enumerate(after):
-                    if re.fullmatch(r"[\d,]+(?:\.0+)?", val) and i+1<len(after) and re.fullmatch(r"(?:EA|PC|PCS|SET|M|KG|L|LOT|BOX|NOS|EACH)", after[i+1], re.I):
-                        quantity, uom = val, after[i+1]; break
-                if not quantity: continue
-                item_id = str(int(float(item)))
-                # Notes may occupy a merged cell or be split across subsequent rows.
-                fragments = []
-                for subsequent in grid[pos+1:]:
-                    flat = ' '.join(x for x in subsequent if x)
-                    if re.search(r"\bMaterial PO text\b|\bQUALITY REQUIREMENTS\b|\bCONTROL RELAY\b|\bMAGNETIC CONTACTOR\b", flat, re.I):
-                        pass
-                    if any(re.fullmatch(r"\d{8,12}(?:\.0)?", x) for x in subsequent): break
-                    if flat.strip():
-                        values = [x for x in subsequent if x]
-                        fragments.append(next((x for x in values if 'Material PO text' in x or 'QUALITY REQUIREMENTS' in x), '') or ('\n'.join(values) if any('\n' in x for x in values) else flat))
-                # Prefer multiline notes in cells; don't join word-wrapped cell paragraphs.
-                combined = '\n'.join(fragments)
-                if not re.search(r"Material PO text", combined, re.I):
-                    # Some XLS files put the PO text immediately after the item description.
-                    combined = '\n'.join(c for c in after if 'Material PO text' in c or 'QUALITY REQUIREMENTS' in c) + ('\n'+combined if combined else '')
-                if 'material po text' not in combined.lower() and '[material po text]' not in combined.lower():
-                    continue
-                records.append({'RFx Number':rfq_number, 'RFx Item No': item_id,
-                                'PR Item No':'', 'Material No':str(int(float(mat_value))),
-                                'Description': desc.split('\n')[0], 'PO Text':combined.strip(),
-                                'QTY':quantity, 'UOM':uom})
-    unique = {r['RFx Item No']:r for r in records}
-    return list(unique.values())
+        frame = pd.read_excel(book, sheet_name=name, header=None,
+                              dtype=object, keep_default_na=False)
+        grid = [[_clean(value) for value in row]
+                for row in frame.itertuples(index=False, name=None)]
+        if not grid:
+            continue
 
+        # A PO text cell is typically a huge merged text block containing all
+        # material details and QA sections, rather than several worksheet rows.
+        notes = []
+        for row_index, row in enumerate(grid):
+            for col_index, cell in enumerate(row):
+                if re.search(r"Material\s+PO\s+text", cell, re.I) and (
+                    "\n" in cell or len(cell) > 100
+                ):
+                    notes.append((row_index, col_index, cell))
+
+        # Identify item header rows via 7-12 digit material ids. A line/item
+        # number may be in the same row or just above due to merged cells.
+        headers = []
+        seen = set()
+        for row_index, row in enumerate(grid):
+            for col_index, value in enumerate(row):
+                match = re.fullmatch(r"(\d{7,12})(?:\.0+)?", value)
+                if not match:
+                    continue
+                material = match.group(1)
+                if material in seen or material == rfq_number:
+                    continue
+                # Avoid RFQ number, vendor identifier, phone, dates and other
+                # numbers outside the item table: demand a short description.
+                candidate_rows = grid[max(0, row_index-1):min(len(grid), row_index+3)]
+                near = [v for rr in candidate_rows for v in rr if v]
+                desc_candidates = [v for v in row[col_index+1:] if
+                                   re.search(r"[A-Za-z]{3}", v)
+                                   and not re.match(r"^(?:Material PO Text|Quality Requirements|\[)", v, re.I)
+                                   and len(v) < 220]
+                if not desc_candidates:
+                    desc_candidates = [v for v in near if
+                                       re.search(r"[A-Za-z]{3}", v)
+                                       and len(v) < 110
+                                       and re.search(r"[,/:]", v)
+                                       and not re.search(r"(?:VENDOR|RFQ|DATE|BUYER|PHONE|EMAIL|ITEM\s+DESCRIPTION)", v, re.I)]
+                if not desc_candidates:
+                    continue
+                description = desc_candidates[0].splitlines()[0].strip()
+                item = ""
+                # Look to the left first, then one row above; Excel merged
+                # headers sometimes store item and material separately.
+                for rr in [row] + ([grid[row_index-1]] if row_index else []):
+                    left = rr[max(0, col_index-5):col_index]
+                    for v in reversed(left):
+                        if re.fullmatch(r"\d{1,4}(?:\.0+)?", v):
+                            item = str(int(float(v)))
+                            break
+                    if item:
+                        break
+                if not item:
+                    continue
+                # Identify a quantity and UOM pair in same/adjacent row.
+                qty, unit = "", ""
+                for rr in [row] + grid[row_index+1:row_index+3]:
+                    values = [(j,v) for j,v in enumerate(rr) if v]
+                    for k,(j,v) in enumerate(values):
+                        if not re.fullmatch(r"\d{1,7}(?:,\d{3})*(?:\.0+)?",v):
+                            continue
+                        if k+1 >= len(values):
+                            continue
+                        u = values[k+1][1]
+                        if re.fullmatch(r"EA|PC|PCS|SET|M|KG|L|LOT|BOX|NOS|EACH|ROLL|PACK|PAIR",u,re.I):
+                            qty,unit=v,u
+                            break
+                    if qty:
+                        break
+                headers.append(dict(row=row_index, item=item, material=material,
+                                    description=description, qty=qty, unit=unit))
+                seen.add(material)
+
+        # The text cells' source ordering is more dependable than the row
+        # spacing in Nawah merged worksheets.
+        headers.sort(key=lambda x:x['row'])
+        notes.sort(key=lambda x:(x[0],x[1]))
+        if headers and len(notes) >= len(headers):
+            for index, header in enumerate(headers):
+                header['note'] = notes[index][2]
+        else:
+            # If item header rows don't parse reliably, use the text blocks'
+            # nearby context; do not emit fabricated item records.
+            for header in headers:
+                following = [x for x in notes if x[0] >= header['row']]
+                if following:
+                    header['note'] = following[0][2]
+
+        for header in headers:
+            if not header.get('note') or not header['qty'] or not header['unit']:
+                continue
+            records.append({'RFx Number': rfq_number,
+                            'RFx Item No': header['item'], 'PR Item No': '',
+                            'Material No': header['material'],
+                            'Description': header['description'],
+                            'PO Text': header['note'].strip(),
+                            'QTY': header['qty'], 'UOM': header['unit']})
+    # Keep the first occurrence of each material/item combination.
+    unique = {}
+    for rec in records:
+        unique.setdefault((rec['RFx Item No'],rec['Material No']),rec)
+    return list(unique.values())
 
 def parse_nawah_rfq_excel(book, filename):
     rfq = re.search(r"\d{10}", filename)
