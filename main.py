@@ -411,11 +411,16 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
         formatted, manufacturer = (format_tabular_pdf_note(note)
                                    if format_style == "tabular_pdf"
                                    else process_rfq_text(note))
+        is_table = format_style == "tabular_pdf"
+        # On this PDF layout the first line is the description. Show that full
+        # original item in the left reference, but keep PO Text separate for export.
+        source = (str(desc).strip() + "\n" + _clean(note)).strip() if is_table else _clean(note)
         queue.append({"line": line, "desc": desc, "qty": qty, "uom": uom,
-                      "source": _clean(note), "formatted": formatted,
-                      "manufacturer": manufacturer, "verified": False, "editing": False})
+                      "source": source, "formatted": formatted,
+                      "tabular_pdf": is_table, "manufacturer": manufacturer,
+                      "verified": False, "editing": False})
     for old_key in list(st.session_state):
-        if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_", f"editable_{session_prefix}_", f"editablemaker_{session_prefix}_")):
+        if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_", f"editable_{session_prefix}_", f"editablemaker_{session_prefix}_", f"desc_{session_prefix}_")):
             del st.session_state[old_key]
     st.session_state[f"{session_prefix}_review"] = {
         "queue": queue, "position": 0, "suffix": suffix,
@@ -521,6 +526,8 @@ def confirm_verify_all_popup(session_prefix):
             queue = review["queue"]
             pos = review["position"]
             item = queue[pos]
+            if item.get("tabular_pdf"):
+                item["desc"] = st.session_state.get(f"desc_{session_prefix}_{pos}", item["desc"]).strip()
             if item["editing"]:
                 item["formatted"] = st.session_state.get(f"editable_{session_prefix}_{pos}", item["formatted"])
                 item["manufacturer"] = st.session_state.get(f"editablemaker_{session_prefix}_{pos}", item["manufacturer"])
@@ -556,15 +563,24 @@ def review_popup(session_prefix):
         st.session_state[maker_key] = item["manufacturer"]
     edit_text_key = f"editable_{session_prefix}_{position}"
     edit_maker_key = f"editablemaker_{session_prefix}_{position}"
+    desc_key = f"desc_{session_prefix}_{position}"
+    if item.get("tabular_pdf") and desc_key not in st.session_state:
+        st.session_state[desc_key] = str(item["desc"])
     left, right = st.columns([1, 1], gap="medium", vertical_alignment="top")
     with left:
         st.markdown("**Original text** · :gray[Read-only / selectable]")
         active_draft = (st.session_state.get(edit_text_key, st.session_state[text_key])
                         if item["editing"] else st.session_state[text_key])
-        colored_reference(item["source"], active_draft)
+        comparison_text = ((st.session_state.get(desc_key, item["desc"]) + "\n")
+                           if item.get("tabular_pdf") else "") + active_draft
+        colored_reference(item["source"], comparison_text)
         st.caption("Red = source line not found in the formatted text (check before approval).")
     with right:
-        st.markdown("**Formatted text** · :gray[" + ("Editing" if item["editing"] else "Preview") + "]")
+        if item.get("tabular_pdf"):
+            st.text_input("Description (first line of PDF item)", key=desc_key,
+                          help="Only for table-style PDFs. Edit this value to correct the Working Sheet Description column.")
+            st.caption("The original description remains visible on the left.")
+        st.markdown("**Formatted PO Text** · :gray[" + ("Editing" if item["editing"] else "Preview") + "]")
         if item["editing"]:
             # Separate widget keys prevent Streamlit from resetting the stored
             # draft when switching a read-only code block into an editor.
@@ -586,12 +602,16 @@ def review_popup(session_prefix):
         if st.button("Previous", disabled=position == 0, key=f"back_{session_prefix}"):
             item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
             item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
+            if item.get("tabular_pdf"):
+                item["desc"] = st.session_state.get(desc_key, item["desc"])
             review["position"] -= 1
             st.rerun(scope="fragment")
     with skip_col:
         if st.button("Close / resume later", key=f"close_{session_prefix}"):
             item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
             item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
+            if item.get("tabular_pdf"):
+                item["desc"] = st.session_state.get(desc_key, item["desc"])
             st.rerun()
     with edit_col:
         if st.button("Edit" if not item["editing"] else "Editing", key=f"edit_{session_prefix}",
@@ -607,9 +627,13 @@ def review_popup(session_prefix):
         if st.button("Verify & Next" if position + 1 < len(queue) else "Verify & Finish",
                      type="primary", key=f"verify_{session_prefix}", use_container_width=True):
             updated = (st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]).strip()
-            if item["source"] and not updated:
+            desc_value = st.session_state.get(desc_key, item["desc"]).strip() if item.get("tabular_pdf") else item["desc"]
+            if item.get("tabular_pdf") and not desc_value:
+                st.error("Description cannot be empty for this PDF layout.")
+            elif item["source"] and not updated:
                 st.error("Formatted text cannot be empty when the original text has content.")
             else:
+                item["desc"] = desc_value
                 item["formatted"] = updated
                 item["manufacturer"] = (st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]).strip()
                 item["verified"] = True
