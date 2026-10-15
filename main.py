@@ -237,6 +237,15 @@ def manufacture_name(text):
     return process_rfq_text(text)[1]
 
 def pdf_text(pdf_file):
+    """Extract page text with dependable physical line breaks for RFQ tables."""
+    pdf_file.seek(0)
+    if fitz is not None:
+        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        try:
+            return "\n".join(page.get_text("text", sort=True) for page in doc)
+        finally:
+            doc.close()
+    pdf_file.seek(0)
     reader = PdfReader(pdf_file)
     output = []
     for i, page in enumerate(reader.pages, start=1):
@@ -244,23 +253,71 @@ def pdf_text(pdf_file):
             output.append(page.extract_text() or "")
         except Exception as exc:
             raise ValueError(f"Cannot extract page {i}: {exc}") from exc
-    return "".join(output)
+    return "\n".join(output)
 
 def parse_pdf(body, full_rfq_text):
-    rfq_match = re.search(r"RFQ Number (\d+)", full_rfq_text)
+    """Read ADNOC Gas item blocks without relying on one-line PDF text layout.
+
+    PDF text extractors commonly place each table cell on its own physical line.
+    The old all-on-one-line regex therefore missed valid RFQ item rows.
+    """
+    rfq_match = re.search(r"RFQ\s+Number\s+(\d+)", full_rfq_text, re.I)
     rfq_number = rfq_match.group(1) if rfq_match else "Unknown"
-    item_pattern = re.compile(r"(\d{5}) (\w?12\d{10}) (\d+(?:\.\d+)?)\s*(\w+) .*?(\d{2}\.\d{2}\.\d{4})", re.S)
-    short_pattern = re.compile(r"Short Text :(.*?)\n", re.S)
-    po_pattern = re.compile(r"PO Material Text :(.*?)Agreement / LineNo.", re.S)
-    items = item_pattern.findall(body)
-    shorts = short_pattern.findall(body)
-    pos = po_pattern.findall(body)
+    lines = [line.strip() for line in full_rfq_text.splitlines()]
     results = []
+    # ADNOC item header: 00010, 12-digit material number, qty, UOM, price,
+    # total, VAT, date; the PDF may wrap each cell onto a different line.
+    start_pattern = re.compile(r"^\d{5}$")
+    material_pattern = re.compile(r"^(?:B?12\d{10}|B?15\d{10}|B?16\d{10})$")
+    date_pattern = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    candidates = []
+    for i, value in enumerate(lines):
+        if not start_pattern.fullmatch(value):
+            continue
+        following = lines[i+1:i+12]
+        if len(following) < 7 or not material_pattern.fullmatch(following[0]):
+            continue
+        if not re.fullmatch(r"[\d,]+(?:\.\d+)?", following[1]):
+            continue
+        if not re.fullmatch(r"[A-Za-z]{1,8}", following[2]):
+            continue
+        if not any(date_pattern.fullmatch(v) for v in following[3:10]):
+            continue
+        candidates.append(i)
+    for number, idx in enumerate(candidates):
+        next_idx = candidates[number+1] if number+1 < len(candidates) else len(lines)
+        # Limit to the material item, not the next page's boilerplate.
+        segment = lines[idx:next_idx]
+        short_pos = next((j for j, v in enumerate(segment) if re.match(r"^Short Text\s*:",v,re.I)), None)
+        if short_pos is None:
+            continue
+        short_text = re.sub(r"^Short Text\s*:\s*", "", segment[short_pos], flags=re.I)
+        # Stop at Agreement/LineNo., plant/storage, or footer content.
+        stop_pos = next((j for j in range(short_pos+1,len(segment))
+                         if re.match(r"^(?:Agreement\s*/\s*LineNo\.|COMMENTS OR SPECIAL INSTRUCTION|REQUEST FOR QUOTATION|INSPECTION/TESTING AND CERTIFICATION REQUIREMENTS)",segment[j],re.I)), len(segment))
+        block = segment[short_pos+1:stop_pos]
+        po_start = next((j for j,v in enumerate(block) if re.match(r"^PO Material Text\s*:",v,re.I)), None)
+        po_lines = block[po_start+1:] if po_start is not None else block
+        # Keep section boundaries, blank lines and all substantive content.
+        note = "\n".join(po_lines).strip()
+        results.append({"RFx Number":rfq_number,
+                        "RFx Item No":str(int(lines[idx])),
+                        "PR Item No":"", "Material No":lines[idx+1],
+                        "Description":short_text, "PO Text":note,
+                        "QTY":lines[idx+2], "UOM":lines[idx+3]})
+    if results:
+        return results
+    # Preserve support for unusual legacy exports where item fields are inline.
+    pattern = re.compile(r"(\d{5})\s+(\w?12\d{10})\s+(\d+(?:\.\d+)?)\s+(\w+)\s+.*?(\d{2}\.\d{2}\.\d{4})", re.S)
+    items = pattern.findall(body)
+    shorts = re.findall(r"Short Text :(.*?)\n", body, re.S)
+    notes = re.findall(r"PO Material Text :(.*?)Agreement / LineNo\.", body, re.S)
     for i, item in enumerate(items):
-        material = item[1] if item[1].startswith(("B12", "12", "B16", "15")) else ""
-        results.append({"RFx Number":rfq_number, "RFx Item No":item[0], "PR Item No":"",
-                        "Material No":material, "Description":shorts[i] if i<len(shorts) else "",
-                        "PO Text":pos[i] if i<len(pos) else "", "QTY":item[2], "UOM":item[3]})
+        results.append({"RFx Number":rfq_number, "RFx Item No":str(int(item[0])),
+                        "PR Item No":"", "Material No":item[1],
+                        "Description":shorts[i].strip() if i<len(shorts) else "",
+                        "PO Text":notes[i].strip() if i<len(notes) else "",
+                        "QTY":item[2], "UOM":item[3]})
     return results
 
 def parse_tabular_rfq_pdf(pdf_file):
@@ -284,7 +341,11 @@ def parse_tabular_rfq_pdf(pdf_file):
                 match = re.search(r"RFQ\s*FORM\s*\n\s*(\d{8,})", lines, re.I)
                 if match:
                     rfq_number = match.group(1)
-            # Detect actual table columns via header token coordinates.
+            # Only accept the Fertil RFQ FORM layout. ADNOC's Material Number /
+            # Description table uses very different columns and item markers.
+            if not (re.search(r"\bRFQ\s+FORM\b", lines, re.I)
+                    and "PR item" in lines and "Quantity" in lines):
+                continue
             words = page.get_text("words", sort=True)
             header_y = None
             for w in words:
@@ -350,7 +411,8 @@ def parse_tabular_rfq_pdf(pdf_file):
     if not found_layout:
         return None
     if not all_items:
-        raise ValueError("Tabular RFQ layout detected but no complete rows extracted; review PDF text positions.")
+        # Do not abort other PDF layouts if coordinate extraction did not match.
+        return None
     return all_items
 
 def resolve_template(uploaded, default_filename):
@@ -473,11 +535,12 @@ def _comparison_line(line):
 REVIEW_PANEL_HEIGHT = 510
 
 
-def _review_panel(body, *, empty_label="(No text)"):
+def _review_panel(body, *, empty_label="(No text)", panel_height=None):
     """Matching, independent, fixed-height panels for both review columns."""
     content = body if body else html.escape(empty_label)
+    actual_height = panel_height or REVIEW_PANEL_HEIGHT
     st.html(
-        '<div style="box-sizing:border-box;height:' + str(REVIEW_PANEL_HEIGHT) + 'px;'
+        '<div style="box-sizing:border-box;height:' + str(actual_height) + 'px;'
         'overflow-y:auto;overflow-x:hidden;background:#1a1d26;color:#f4f4f5;'
         'border:1px solid #363b48;border-radius:10px;padding:16px;'
         'user-select:text;scrollbar-gutter:stable">'
@@ -488,7 +551,7 @@ def _review_panel(body, *, empty_label="(No text)"):
     )
 
 
-def colored_reference(original, formatted):
+def colored_reference(original, formatted, panel_height=None):
     """Original text with preserved whitespace and red unmatched lines."""
     formatted_lines = [_comparison_line(x) for x in formatted.splitlines() if x.strip()]
     highlighted_lines = []
@@ -505,7 +568,7 @@ def colored_reference(original, formatted):
     content = "\n".join(highlighted_lines)
     if original.endswith("\n"):
         content += "\n"
-    _review_panel(content, empty_label="(No original Internal Note)")
+    _review_panel(content, empty_label="(No original Internal Note)", panel_height=panel_height)
 
 
 def formatted_reference(formatted):
@@ -573,7 +636,8 @@ def review_popup(session_prefix):
                         if item["editing"] else st.session_state[text_key])
         comparison_text = ((st.session_state.get(desc_key, item["desc"]) + "\n")
                            if item.get("tabular_pdf") else "") + active_draft
-        colored_reference(item["source"], comparison_text)
+        colored_reference(item["source"], comparison_text,
+                          panel_height=REVIEW_PANEL_HEIGHT + 98 if item.get("tabular_pdf") else REVIEW_PANEL_HEIGHT)
         st.caption("Red = source line not found in the formatted text (check before approval).")
     with right:
         if item.get("tabular_pdf"):
