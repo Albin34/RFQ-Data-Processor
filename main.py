@@ -232,7 +232,7 @@ def format_rfq_python(text):
             chunks.append(section + ":\n" + "\n".join(lines))
     # Always preserve relevant data, even when no headers were present.
     output = "\n\n".join(chunks)
-    return normalize_pdf_symbols(output), extract_manufacturers(raw)
+    return remove_separator_lines(normalize_pdf_symbols(output)), extract_manufacturers(raw)
 
 
 def process_rfq_text(text):
@@ -381,7 +381,7 @@ def summarize_nawah_working_note(raw):
     result = "Material PO Text:\n\n" + material if material else "Material PO Text:"
     if clauses:
         result += "\n\nQUALITY REQUIREMENTS\n\n" + "\n".join(clauses)
-    return result, extract_manufacturers(material)
+    return remove_separator_lines(normalize_pdf_symbols(result)), extract_manufacturers(material)
 
 
 def _nawah_excel_records(book, rfq_number):
@@ -581,7 +581,7 @@ def format_nawah_pdf_note(note):
     raw = normalize_pdf_symbols(str(note).replace("\r\n", "\n")).strip()
     # Preserve section breaks, messages, and numbered QA requirements; keep
     # technical attributes on their own lines. Human reviewer controls changes.
-    return raw, extract_manufacturers(raw)
+    return remove_separator_lines(raw), extract_manufacturers(raw)
 
 
 def parse_tabular_rfq_pdf(pdf_file):
@@ -681,6 +681,22 @@ def normalize_pdf_symbols(value):
     return text.replace("<(>&<)>", "&").replace("(>&<)", "&")
 
 
+def remove_separator_lines(value):
+    """Drop visual divider lines made only of separator characters.
+
+    Keep meaningful content such as 'START OF MESSAGE...' while removing
+    lines like '----------------', '************', '.............', or
+    mixed visual separators containing only punctuation.
+    """
+    cleaned = []
+    for line in str(value).splitlines():
+        stripped = line.strip()
+        if stripped and re.fullmatch(r"[\-*=._#~]{4,}", stripped):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def join_pdf_wrapped_lines(note):
     """Join wrapped narrative values, retaining one line per named attribute.
 
@@ -749,7 +765,7 @@ def format_tabular_pdf_note(note):
             manufacturer = match.group(1).strip().strip(", ")
     if not manufacturer:
         manufacturer = extract_manufacturers("\n".join(physical))
-    return "\n".join(output), manufacturer
+    return remove_separator_lines("\n".join(output)), manufacturer
 
 
 def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
