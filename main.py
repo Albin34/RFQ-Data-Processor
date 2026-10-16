@@ -774,7 +774,11 @@ def parse_dubai_petroleum_csv(uploaded):
     uploaded.seek(0)
     content = uploaded.read()
     if isinstance(content, bytes):
-        content = content.decode("utf-8-sig")
+        try:
+            content = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # Some Dubai Petroleum exports use Windows-1252 (e.g. en dashes).
+            content = content.decode("cp1252")
     rows = list(csv.reader(content.splitlines(keepends=True)))
     if not rows:
         raise ValueError("Dubai Petroleum CSV has no rows")
@@ -892,6 +896,12 @@ def finalize_verified(session_prefix):
         }.items():
             sheet[f"{col}{i}"] = value
         sheet[f"A{i}"].fill = copy(line_fill)
+    # Keep the blue Line item number column continuous below the last item.
+    # Replacement templates sometimes have unstyled blank rows between the
+    # populated area and their next preformatted row; fill those gaps too.
+    blue_fill_end_row = max(sheet.max_row, len(queue) + 26)
+    for row_number in range(2, blue_fill_end_row + 1):
+        sheet[f"A{row_number}"].fill = copy(line_fill)
     sheet["E1"] = "Internal Note"
     sheet.delete_cols(8, 1)  # mail id
     sheet.delete_cols(6, 1)  # Subject line; Manufacturer moves to F
