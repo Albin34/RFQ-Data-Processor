@@ -823,10 +823,15 @@ def format_dubai_petroleum_note(source):
                 output.append("")
             continue
         previous = next((item for item in reversed(output) if item), "")
-        is_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER)\s*[.:,]", stripped, re.I))
-        previous_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER)\s*[.:,]", previous, re.I))
+        is_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER(?:\s+NAME)?)\s*[.:,]", stripped, re.I))
+        previous_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER(?:\s+NAME)?)\s*[.:,]", previous, re.I))
+        previous_part = bool(re.match(r"^(?:PART\s*(?:NO\.?|NUMBER)|MFR\.?\s*PART\s*(?:NO\.?|NUMBER)|MANUFACTURER\s+PART\s+NUMBER)\s*:", previous, re.I))
         is_note = bool(re.match(r"^(?:USED FOR\b|NOTE\s*:)", stripped, re.I))
-        if output and output[-1] != "" and ((is_mfr and not previous_mfr) or (is_note and not re.match(r"^USED FOR\b", previous, re.I))):
+        # A part number followed by its manufacturer is one set: no blank
+        # line between them. Separate the set from preceding specifications.
+        new_mfr_group = is_mfr and not previous_mfr and not previous_part
+        new_note_group = is_note and not re.match(r"^USED FOR\b", previous, re.I)
+        if output and output[-1] != "" and (new_mfr_group or new_note_group):
             output.append("")
         output.append(line)
     # Sample Working Sheet leaves Manufacturer blank for multi-brand alternatives.
