@@ -812,28 +812,39 @@ def parse_dubai_petroleum_csv(uploaded):
 
 
 def format_dubai_petroleum_note(source):
-    """Group manufacturer alternatives and notes; preserve all nonempty input text."""
+    """Add readable breaks between logical groups, not inside manufacturer sets.
+
+    Preserve the wording, sequence, and source lines.  Either PART NO -> MFR
+    or MFR -> PART NO is one contiguous pair.
+    """
     text = remove_separator_lines(normalize_pdf_symbols(str(source)))
-    lines = [line.rstrip() for line in text.splitlines()]
+    lines = [line.strip() for line in text.splitlines()]
     output = []
-    for line in lines:
-        stripped = line.strip()
+    manufacturer_re = re.compile(r"^(?:MFR\.?|MANUFACTURER(?:\s+NAME)?)\s*[:.,]", re.I)
+    part_re = re.compile(r"^(?:PART\s*(?:NO\.?|NUMBER)|MFR\.?\s*PART\s*(?:NO\.?|NUMBER)|MANUFACTURER\s+PART\s+NUMBER)\s*:", re.I)
+    note_re = re.compile(r"^(?:USED FOR\b|NOTE\s*:|\*+\s*NOTE\b)", re.I)
+
+    for idx, stripped in enumerate(lines):
         if not stripped:
             if output and output[-1] != "":
                 output.append("")
             continue
-        previous = next((item for item in reversed(output) if item), "")
-        is_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER(?:\s+NAME)?)\s*[.:,]", stripped, re.I))
-        previous_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER(?:\s+NAME)?)\s*[.:,]", previous, re.I))
-        previous_part = bool(re.match(r"^(?:PART\s*(?:NO\.?|NUMBER)|MFR\.?\s*PART\s*(?:NO\.?|NUMBER)|MANUFACTURER\s+PART\s+NUMBER)\s*:", previous, re.I))
-        is_note = bool(re.match(r"^(?:USED FOR\b|NOTE\s*:)", stripped, re.I))
-        # A part number followed by its manufacturer is one set: no blank
-        # line between them. Separate the set from preceding specifications.
-        new_mfr_group = is_mfr and not previous_mfr and not previous_part
-        new_note_group = is_note and not re.match(r"^USED FOR\b", previous, re.I)
-        if output and output[-1] != "" and (new_mfr_group or new_note_group):
+        previous = next((entry for entry in reversed(output) if entry), "")
+        is_mfr = bool(manufacturer_re.match(stripped))
+        is_part = bool(part_re.match(stripped))
+        prev_mfr = bool(manufacturer_re.match(previous))
+        prev_part = bool(part_re.match(previous))
+        is_note = bool(note_re.match(stripped))
+        prev_note = bool(note_re.match(previous))
+
+        # Start a manufacturer/part-number block, but keep the counterpart
+        # on the very next line.  Multiple different pairs remain distinct.
+        start_identification = (is_mfr or is_part) and not (prev_mfr or prev_part)
+        # Notes are separated from specification and identification blocks.
+        start_note = is_note and not prev_note
+        if output and output[-1] != "" and (start_identification or start_note):
             output.append("")
-        output.append(line)
+        output.append(stripped)
     # Sample Working Sheet leaves Manufacturer blank for multi-brand alternatives.
     return "\n".join(output).strip(), ""
 
