@@ -3,6 +3,7 @@
 Preserves the Excel/PDF/HTS/List Maker workflows without external AI APIs.
 """
 import re
+import csv
 import html
 import traceback
 from collections import defaultdict
@@ -768,6 +769,66 @@ def format_tabular_pdf_note(note):
     return remove_separator_lines("\n".join(output)), manufacturer
 
 
+def parse_dubai_petroleum_csv(uploaded):
+    """Parse the Dubai Petroleum bidding export, including empty leading columns."""
+    uploaded.seek(0)
+    content = uploaded.read()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8-sig")
+    rows = list(csv.reader(content.splitlines(keepends=True)))
+    if not rows:
+        raise ValueError("Dubai Petroleum CSV has no rows")
+    header = [re.sub(r"\s+", " ", col.strip()).casefold() for col in rows[0]]
+    required = ("line", "item, rev", "item description", "long description", "unit", "quantity")
+    missing = [name for name in required if name not in header]
+    if missing:
+        raise ValueError("Not a supported Dubai Petroleum CSV export. Missing headings: " + ", ".join(missing))
+    indices = {name: header.index(name) for name in required}
+    parsed = []
+    for index, row in enumerate(rows[1:], start=2):
+        def get(name):
+            col = indices[name]
+            return row[col].strip() if len(row) > col else ""
+        item_no = get("line")
+        if not item_no:
+            continue
+        if not re.fullmatch(r"\d+", item_no):
+            raise ValueError(f"Invalid line number on CSV row {index}: {item_no!r}")
+        description = get("item description")
+        note = get("long description").replace("\r\n", "\n").replace("\r", "\n")
+        quantity = get("quantity")
+        unit = get("unit")
+        if not all((description, note, quantity, unit)):
+            raise ValueError(f"CSV row {index} missing description, long description, quantity or unit")
+        parsed.append({"RFx Item No": str(int(item_no) * 10), "Material No": get("item, rev"),
+                       "Description": description, "PO Text": note, "QTY": quantity, "UOM": unit})
+    if not parsed:
+        raise ValueError("Dubai Petroleum CSV contains no item rows")
+    return parsed
+
+
+def format_dubai_petroleum_note(source):
+    """Group manufacturer alternatives and notes; preserve all nonempty input text."""
+    text = remove_separator_lines(normalize_pdf_symbols(str(source)))
+    lines = [line.rstrip() for line in text.splitlines()]
+    output = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if output and output[-1] != "":
+                output.append("")
+            continue
+        previous = next((item for item in reversed(output) if item), "")
+        is_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER)\s*[.:,]", stripped, re.I))
+        previous_mfr = bool(re.match(r"^(?:MFR\.?|MANUFACTURER)\s*[.:,]", previous, re.I))
+        is_note = bool(re.match(r"^(?:USED FOR\b|NOTE\s*:)", stripped, re.I))
+        if output and output[-1] != "" and ((is_mfr and not previous_mfr) or (is_note and not re.match(r"^USED FOR\b", previous, re.I))):
+            output.append("")
+        output.append(line)
+    # Sample Working Sheet leaves Manufacturer blank for multi-brand alternatives.
+    return "\n".join(output).strip(), ""
+
+
 def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
     if not records:
@@ -777,7 +838,9 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
     template_data = workbook_bytes(template_wb)
     queue = []
     for line, desc, qty, uom, note in records:
-        formatted, manufacturer = (format_tabular_pdf_note(note)
+        formatted, manufacturer = (format_dubai_petroleum_note(note)
+                                   if format_style == "dubai_csv"
+                                   else format_tabular_pdf_note(note)
                                    if format_style == "tabular_pdf"
                                    else summarize_nawah_working_note(note) if format_style in ("nawah_pdf", "nawah_excel")
                                    else process_rfq_text(note))
@@ -1124,6 +1187,46 @@ with col1:
         download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_excel_up")
         if "excel_final_bytes" in st.session_state:
             download_xlsx("Download Working Sheet", st.session_state["excel_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_excel_fin")
+
+st.divider()
+st.subheader("Dubai Petroleum CSV Processor")
+st.caption("Upload the Dubai Petroleum bidding export (.csv). Generates the normal Uploading and Working Sheets with line-by-line review.")
+dubai_csv = st.file_uploader("Dubai Petroleum export (.csv)", type=["csv"], key="dubai_csv")
+dubai_suffix = st.text_input("Output name suffix (Dubai Petroleum)", key="dubai_suffix")
+if st.button("Process Dubai Petroleum CSV", key="btn_dubai"):
+    if dubai_csv is None or not dubai_suffix.strip():
+        st.warning("Upload the Dubai Petroleum CSV and enter an output suffix.")
+    else:
+        try:
+            dubai_items = parse_dubai_petroleum_csv(dubai_csv)
+            upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+            upload_sheet = upload_wb.active
+            clear_template_rows(upload_sheet)
+            records = []
+            for index, rec in enumerate(dubai_items, start=2):
+                cells = {"A": "", "B": rec["RFx Item No"], "C": "",
+                         "D": rec["Material No"], "E": rec["Description"],
+                         "F": rec["PO Text"], "G": normalize_qty(rec["QTY"]),
+                         "H": rec["UOM"], "I": ""}
+                for col, value in cells.items():
+                    upload_sheet[f"{col}{index}"] = value
+                records.append((rec["RFx Item No"], rec["Description"],
+                                rec["QTY"], rec["UOM"], rec["PO Text"]))
+            wrap_all(upload_sheet)
+            prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"),
+                           dubai_suffix.strip(), "dubai", upload_wb, format_style="dubai_csv")
+            st.success(f"Prepared {len(records)} Dubai Petroleum line items for verification")
+            review_popup("dubai")
+        except Exception as exc:
+            show_error("Dubai Petroleum CSV processing failed", exc)
+review_status("dubai")
+if "dubai_upload_bytes" in st.session_state:
+    code = st.session_state["dubai_suffix"]
+    download_xlsx("Download Dubai Uploading Sheet", st.session_state["dubai_upload_bytes"],
+                  f"Uploading Sheet_{code}.xlsx", "dl_dubai_up")
+    if "dubai_final_bytes" in st.session_state:
+        download_xlsx("Download Dubai Working Sheet", st.session_state["dubai_final_bytes"],
+                      f"Working Sheet_{code}.xlsx", "dl_dubai_fin")
 
 with col2:
     st.subheader("PDF Data Processor")
