@@ -1,6 +1,6 @@
 """RFQ Data Processor - Python-only verification edition.
 
-Preserves the Excel/PDF/HTS/List Maker workflows without external AI APIs.
+Preserves the Excel/PDF workflows without external AI APIs.
 """
 import re
 import csv
@@ -1148,12 +1148,12 @@ def download_xlsx(label, data, filename, key):
 
 st.caption("Processing engine: Python rules only | AI/API: Disabled | Every Working Sheet line requires approval")
 
-col1, col2, col3 = st.columns([2, 2, 1])
+col1, col2 = st.columns([1, 1], gap="medium")
 
 with col1:
     st.subheader("Excel Data Processor")
     techno = st.file_uploader("RFQ file (.xls, .xlsx, .csv)", type=["xls", "xlsx", "csv"], key="techno")
-    with st.expander("Excel templates", expanded=True):
+    with st.expander("Excel templates", expanded=False):
         upload_tpl = st.file_uploader("Upload template (.xlsx)", type=["xlsx"], key="tpl_upl")
         final_tpl = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="tpl_fin")
     suffix = st.text_input("Output name suffix", key="suffix_excel")
@@ -1243,7 +1243,7 @@ with col1:
 with col2:
     st.subheader("PDF Data Processor")
     pdf = st.file_uploader("RFQ PDF", type=["pdf"], key="pdf")
-    with st.expander("Excel templates", expanded=True):
+    with st.expander("Excel templates", expanded=False):
         raw_tpl = st.file_uploader("Raw template", type=["xlsx"], key="tpl_raw")
         hts_tpl = st.file_uploader("HTS template", type=["xlsx"], key="tpl_hts")
         pdf_final_tpl = st.file_uploader("Final Sheet template", type=["xlsx"], key="tpl_final_pdf")
@@ -1292,71 +1292,8 @@ with col2:
         if "pdf_final_bytes" in st.session_state:
             download_xlsx("Download Working Sheet", st.session_state["pdf_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_pdf_fin")
 
-with col3:
-    st.subheader("HTS Cleaner")
-    hts_upload = st.file_uploader("Uploading Sheet.xlsx", type=["xlsx"], key="hts_clean")
-    clean_final_tpl = st.file_uploader("Final Sheet template (optional)", type=["xlsx"], key="tpl_clean_fin")
-    if st.button("Clean HTS", key="btn_clean_hts"):
-        if hts_upload is None:
-            st.warning("Upload the HTS workbook")
-        else:
-            try:
-                source = load_workbook(hts_upload).active
-                rows = [r for r in source.iter_rows(min_row=2) if any(c.value is not None for c in r)]
-                if not rows:
-                    raise ValueError("The uploaded HTS workbook contains no data rows")
-                records = []
-                for row in rows:
-                    # Existing HTS layout: B=line, E=description, F=PO text, G=qty, H=UOM.
-                    if len(row) < 8:
-                        raise ValueError("HTS workbook must have at least eight columns")
-                    records.append((row[1].value, row[4].value, row[6].value, row[7].value, row[5].value or ""))
-                prepare_review(records, resolve_template(clean_final_tpl, "Working Sheet.xlsx"), "cleaned", "clean")
-                st.success("HTS RFQ prepared for verification")
-                review_popup("clean")
-            except Exception as exc:
-                show_error("HTS cleaning failed (no incomplete files were saved)", exc)
-    review_status("clean")
-    if "clean_final_bytes" in st.session_state:
-        download_xlsx("Download cleaned FINAL SHEET", st.session_state["clean_final_bytes"], "Working Sheet_cleaned.xlsx", "dl_clean")
-
-    st.subheader("List Maker")
-    final_file = st.file_uploader("FINAL SHEET for manufacturers", type=["xlsx"], key="manuf")
-    if st.button("Build list", key="btn_list"):
-        if final_file is None:
-            st.warning("Upload the FINAL SHEET workbook")
-        else:
-            try:
-                df = pd.read_excel(final_file)
-                groups = defaultdict(lambda: {"items":[], "emails":[]})
-                for _, row in df.iterrows():
-                    manufacturers = _clean(row.get("Manufacturer", ""))
-                    if not manufacturers:
-                        continue
-                    item = row.get("Line item number", "")
-                    emails = [row[col] for col in df.columns if ("mail" in str(col).lower() or "unnamed" in str(col).lower()) and pd.notna(row[col])]
-                    for name in (x.strip() for x in manufacturers.split("-") if x.strip()):
-                        groups[name]["items"].append(item)
-                        groups[name]["emails"].extend(emails)
-                lines = []
-                for manufacturer, values in groups.items():
-                    items = sorted({_clean(x) for x in values["items"] if _clean(x)})
-                    lines.append(f"Item {', '.join(items)}: {manufacturer}")
-                    lines.extend(dict.fromkeys(_clean(x) for x in values["emails"] if _clean(x)))
-                    lines.append("")
-                st.session_state["manufacturer_list"] = "\n".join(lines)
-            except Exception as exc:
-                show_error("List creation failed", exc)
-    if "manufacturer_list" in st.session_state:
-        st.text_area("Output", st.session_state["manufacturer_list"], height=300)
-        try:
-            from st_copy_to_clipboard import st_copy_to_clipboard
-            st_copy_to_clipboard(st.session_state["manufacturer_list"])
-        except ImportError:
-            st.caption("Select the text above to copy it.")
-
 # Display at most one modal per Streamlit run. Separate dialogs cannot be nested.
-for _prefix in ("excel", "pdf", "clean"):
+for _prefix in ("excel", "pdf"):
     _review = st.session_state.get(f"{_prefix}_review")
     if not _review or _review.get("completed"):
         continue
