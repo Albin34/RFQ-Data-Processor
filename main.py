@@ -1118,7 +1118,7 @@ col1, col2, col3 = st.columns([2, 2, 1])
 
 with col1:
     st.subheader("Excel Data Processor")
-    techno = st.file_uploader("Techno-Commercial Envelope (.xls)", type=["xls"], key="techno")
+    techno = st.file_uploader("RFQ file (.xls, .xlsx, .csv)", type=["xls", "xlsx", "csv"], key="techno")
     with st.expander("Excel templates", expanded=True):
         upload_tpl = st.file_uploader("Upload template (.xlsx)", type=["xlsx"], key="tpl_upl")
         final_tpl = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="tpl_fin")
@@ -1130,53 +1130,71 @@ with col1:
             try:
                 rfq_match = re.search(r"\d+", techno.name)
                 rfq_number = rfq_match.group() if rfq_match else "Unknown"
-                book = pd.ExcelFile(techno)
-                is_nawah_excel = False
-                # Ariba uses Description/InternalNote/Quantity/Unit of Measure.
-                # Nawah uses a different table layout and long PO text cells.
-                required = {"Description", "InternalNote", "Quantity", "Unit of Measure"}
-                matching = None
-                for name in book.sheet_names:
-                    headings = set(map(str, pd.read_excel(book, sheet_name=name, nrows=1).columns))
-                    if required.issubset(headings):
-                        matching = name
-                        break
-                if matching is None:
-                    is_nawah_excel = True
-                    nawah_records = parse_nawah_rfq_excel(book, techno.name)
-                    upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+                if techno.name.lower().endswith(".csv"):
+                    csv_records = parse_dubai_petroleum_csv(techno)
+                    upload_wb = load_workbook(resolve_template(upload_tpl, "Uploading Sheet.xlsx"))
                     upload_sheet = upload_wb.active
                     clear_template_rows(upload_sheet)
                     records = []
-                    for i, rec in enumerate(nawah_records, 2):
-                        for col, val in {"A":rec['RFx Number'], "B":rec['RFx Item No'], "C":rec['PR Item No'],
-                                         "D":rec['Material No'], "E":rec['Description'], "F":rec['PO Text'],
-                                         "G":normalize_qty(rec['QTY']), "H":rec['UOM'], "I":rec.get('ARIBA Number', '')}.items():
-                            upload_sheet[f"{col}{i}"] = val
-                        records.append((rec['RFx Item No'],rec['Description'],rec['QTY'],rec['UOM'],rec['PO Text']))
+                    for row_index, rec in enumerate(csv_records, start=2):
+                        values = {"A": "", "B": rec["RFx Item No"], "C": "",
+                                  "D": rec["Material No"], "E": rec["Description"],
+                                  "F": rec["PO Text"], "G": normalize_qty(rec["QTY"]),
+                                  "H": rec["UOM"], "I": ""}
+                        for column, value in values.items():
+                            upload_sheet[f"{column}{row_index}"] = value
+                        records.append((rec["RFx Item No"], rec["Description"],
+                                        rec["QTY"], rec["UOM"], rec["PO Text"]))
+                    selected_style = "dubai_csv"
                 else:
-                    df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
-                    description = df["Description"].astype(str).str.strip().str.lower()
-                    qty = df["Quantity"].astype(str).str.strip()
-                    uom = df["Unit of Measure"].astype(str).str.strip()
-                    valid = df[description.ne("item or lot description") & qty.ne("") & uom.ne("") & uom.str.lower().ne("unit of measure")]
-                    if valid.empty:
-                        raise ValueError("No valid RFQ line items found")
-                    upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
-                    upload_sheet = upload_wb.active
-                    clear_template_rows(upload_sheet)
-                    records = []
-                    for i, (_, rec) in enumerate(valid.iterrows()):
-                        line = (i+1)*10
-                        row = i+2
-                        values = {"A":rfq_number, "B":line, "E":rec["Description"],
-                                  "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
-                                  "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
-                        for c, value in values.items():
-                            upload_sheet[f"{c}{row}"] = value
-                        records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
+                    book = pd.ExcelFile(techno)
+                    is_nawah_excel = False
+                    # Ariba uses Description/InternalNote/Quantity/Unit of Measure.
+                    # Nawah uses a different table layout and long PO text cells.
+                    required = {"Description", "InternalNote", "Quantity", "Unit of Measure"}
+                    matching = None
+                    for name in book.sheet_names:
+                        headings = set(map(str, pd.read_excel(book, sheet_name=name, nrows=1).columns))
+                        if required.issubset(headings):
+                            matching = name
+                            break
+                    if matching is None:
+                        is_nawah_excel = True
+                        nawah_records = parse_nawah_rfq_excel(book, techno.name)
+                        upload_wb = load_workbook(resolve_template(upload_tpl, "Uploading Sheet.xlsx"))
+                        upload_sheet = upload_wb.active
+                        clear_template_rows(upload_sheet)
+                        records = []
+                        for i, rec in enumerate(nawah_records, 2):
+                            for col, val in {"A":rec['RFx Number'], "B":rec['RFx Item No'], "C":rec['PR Item No'],
+                                             "D":rec['Material No'], "E":rec['Description'], "F":rec['PO Text'],
+                                             "G":normalize_qty(rec['QTY']), "H":rec['UOM'], "I":rec.get('ARIBA Number', '')}.items():
+                                upload_sheet[f"{col}{i}"] = val
+                            records.append((rec['RFx Item No'],rec['Description'],rec['QTY'],rec['UOM'],rec['PO Text']))
+                    else:
+                        df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
+                        description = df["Description"].astype(str).str.strip().str.lower()
+                        qty = df["Quantity"].astype(str).str.strip()
+                        uom = df["Unit of Measure"].astype(str).str.strip()
+                        valid = df[description.ne("item or lot description") & qty.ne("") & uom.ne("") & uom.str.lower().ne("unit of measure")]
+                        if valid.empty:
+                            raise ValueError("No valid RFQ line items found")
+                        upload_wb = load_workbook(resolve_template(upload_tpl, "Uploading Sheet.xlsx"))
+                        upload_sheet = upload_wb.active
+                        clear_template_rows(upload_sheet)
+                        records = []
+                        for i, (_, rec) in enumerate(valid.iterrows()):
+                            line = (i+1)*10
+                            row = i+2
+                            values = {"A":rfq_number, "B":line, "E":rec["Description"],
+                                      "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
+                                      "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
+                            for c, value in values.items():
+                                upload_sheet[f"{c}{row}"] = value
+                            records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
+                    selected_style = "nawah_excel" if is_nawah_excel else "default"
                 wrap_all(upload_sheet)
-                prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"), suffix.strip(), "excel", upload_wb, format_style="nawah_excel" if is_nawah_excel else "default")
+                prepare_review(records, resolve_template(final_tpl, "Working Sheet.xlsx"), suffix.strip(), "excel", upload_wb, format_style=selected_style)
                 st.success("Excel RFQ prepared for verification")
                 review_popup("excel")
             except Exception as exc:
@@ -1199,7 +1217,7 @@ if st.button("Process Dubai Petroleum CSV", key="btn_dubai"):
     else:
         try:
             dubai_items = parse_dubai_petroleum_csv(dubai_csv)
-            upload_wb = load_workbook(resolve_template(upload_tpl, "upload file - HTS.xlsx"))
+            upload_wb = load_workbook(resolve_template(upload_tpl, "Uploading Sheet.xlsx"))
             upload_sheet = upload_wb.active
             clear_template_rows(upload_sheet)
             records = []
@@ -1213,7 +1231,7 @@ if st.button("Process Dubai Petroleum CSV", key="btn_dubai"):
                 records.append((rec["RFx Item No"], rec["Description"],
                                 rec["QTY"], rec["UOM"], rec["PO Text"]))
             wrap_all(upload_sheet)
-            prepare_review(records, resolve_template(final_tpl, "FINAL SHEET.xlsx"),
+            prepare_review(records, resolve_template(final_tpl, "Working Sheet.xlsx"),
                            dubai_suffix.strip(), "dubai", upload_wb, format_style="dubai_csv")
             st.success(f"Prepared {len(records)} Dubai Petroleum line items for verification")
             review_popup("dubai")
@@ -1255,7 +1273,7 @@ with col2:
                     data = parse_pdf(body, full)
                 if not data:
                     raise ValueError("No RFQ items parsed. The PDF may not match the supported RFQ layout or may be scanned.")
-                upload_wb = load_workbook(resolve_template(hts_tpl, "upload file - HTS.xlsx"))
+                upload_wb = load_workbook(resolve_template(hts_tpl, "Uploading Sheet.xlsx"))
                 sheet = upload_wb.active
                 clear_template_rows(sheet)
                 records = []
@@ -1267,7 +1285,7 @@ with col2:
                         sheet[f"{col}{i}"] = normalize_qty(item[field]) if field == "QTY" else item[field]
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
-                prepare_review(records, resolve_template(pdf_final_tpl, "FINAL SHEET.xlsx"), hts_number.strip(), "pdf", upload_wb,
+                prepare_review(records, resolve_template(pdf_final_tpl, "Working Sheet.xlsx"), hts_number.strip(), "pdf", upload_wb,
                                format_style="nawah_pdf" if is_nawah_pdf else "tabular_pdf" if is_tabular_pdf else "default")
                 st.success("PDF RFQ prepared for verification")
                 review_popup("pdf")
@@ -1282,7 +1300,7 @@ with col2:
 
 with col3:
     st.subheader("HTS Cleaner")
-    hts_upload = st.file_uploader("upload file - HTS.xlsx", type=["xlsx"], key="hts_clean")
+    hts_upload = st.file_uploader("Uploading Sheet.xlsx", type=["xlsx"], key="hts_clean")
     clean_final_tpl = st.file_uploader("Final Sheet template (optional)", type=["xlsx"], key="tpl_clean_fin")
     if st.button("Clean HTS", key="btn_clean_hts"):
         if hts_upload is None:
@@ -1299,7 +1317,7 @@ with col3:
                     if len(row) < 8:
                         raise ValueError("HTS workbook must have at least eight columns")
                     records.append((row[1].value, row[4].value, row[6].value, row[7].value, row[5].value or ""))
-                prepare_review(records, resolve_template(clean_final_tpl, "FINAL SHEET.xlsx"), "cleaned", "clean")
+                prepare_review(records, resolve_template(clean_final_tpl, "Working Sheet.xlsx"), "cleaned", "clean")
                 st.success("HTS RFQ prepared for verification")
                 review_popup("clean")
             except Exception as exc:
