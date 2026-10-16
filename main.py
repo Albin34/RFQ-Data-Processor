@@ -877,6 +877,13 @@ def finalize_verified(session_prefix):
     wb = load_workbook(BytesIO(review["template"]))
     sheet = wb.active
     clear_template_rows(sheet)
+    # Some replacement Working Sheet templates style only row 1. Carry its
+    # line-item blue fill into every populated data row (without recoloring
+    # other columns or overwriting fonts, borders or alignment).
+    from openpyxl.styles import PatternFill
+    line_fill = copy(sheet["A1"].fill)
+    if line_fill.patternType != "solid":
+        line_fill = PatternFill(fill_type="solid", fgColor="B4C6E7")
     for i, item in enumerate(queue, 2):
         for col, value in {
             "A": item["line"], "B": item["desc"], "C": item["qty"],
@@ -884,6 +891,7 @@ def finalize_verified(session_prefix):
             "G": item["manufacturer"],
         }.items():
             sheet[f"{col}{i}"] = value
+        sheet[f"A{i}"].fill = copy(line_fill)
     sheet["E1"] = "Internal Note"
     sheet.delete_cols(8, 1)  # mail id
     sheet.delete_cols(6, 1)  # Subject line; Manufacturer moves to F
@@ -1205,46 +1213,6 @@ with col1:
         download_xlsx("Download Upload file", st.session_state["excel_upload_bytes"], f"Uploading Sheet_{s}.xlsx", "dl_excel_up")
         if "excel_final_bytes" in st.session_state:
             download_xlsx("Download Working Sheet", st.session_state["excel_final_bytes"], f"Working Sheet_{s}.xlsx", "dl_excel_fin")
-
-st.divider()
-st.subheader("Dubai Petroleum CSV Processor")
-st.caption("Upload the Dubai Petroleum bidding export (.csv). Generates the normal Uploading and Working Sheets with line-by-line review.")
-dubai_csv = st.file_uploader("Dubai Petroleum export (.csv)", type=["csv"], key="dubai_csv")
-dubai_suffix = st.text_input("Output name suffix (Dubai Petroleum)", key="dubai_suffix")
-if st.button("Process Dubai Petroleum CSV", key="btn_dubai"):
-    if dubai_csv is None or not dubai_suffix.strip():
-        st.warning("Upload the Dubai Petroleum CSV and enter an output suffix.")
-    else:
-        try:
-            dubai_items = parse_dubai_petroleum_csv(dubai_csv)
-            upload_wb = load_workbook(resolve_template(upload_tpl, "Uploading Sheet.xlsx"))
-            upload_sheet = upload_wb.active
-            clear_template_rows(upload_sheet)
-            records = []
-            for index, rec in enumerate(dubai_items, start=2):
-                cells = {"A": "", "B": rec["RFx Item No"], "C": "",
-                         "D": rec["Material No"], "E": rec["Description"],
-                         "F": rec["PO Text"], "G": normalize_qty(rec["QTY"]),
-                         "H": rec["UOM"], "I": ""}
-                for col, value in cells.items():
-                    upload_sheet[f"{col}{index}"] = value
-                records.append((rec["RFx Item No"], rec["Description"],
-                                rec["QTY"], rec["UOM"], rec["PO Text"]))
-            wrap_all(upload_sheet)
-            prepare_review(records, resolve_template(final_tpl, "Working Sheet.xlsx"),
-                           dubai_suffix.strip(), "dubai", upload_wb, format_style="dubai_csv")
-            st.success(f"Prepared {len(records)} Dubai Petroleum line items for verification")
-            review_popup("dubai")
-        except Exception as exc:
-            show_error("Dubai Petroleum CSV processing failed", exc)
-review_status("dubai")
-if "dubai_upload_bytes" in st.session_state:
-    code = st.session_state["dubai_suffix"]
-    download_xlsx("Download Dubai Uploading Sheet", st.session_state["dubai_upload_bytes"],
-                  f"Uploading Sheet_{code}.xlsx", "dl_dubai_up")
-    if "dubai_final_bytes" in st.session_state:
-        download_xlsx("Download Dubai Working Sheet", st.session_state["dubai_final_bytes"],
-                      f"Working Sheet_{code}.xlsx", "dl_dubai_fin")
 
 with col2:
     st.subheader("PDF Data Processor")
