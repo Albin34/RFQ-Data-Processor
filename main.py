@@ -970,10 +970,10 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     right = html.escape(formatted)
     document = """<!doctype html><html><head><meta charset="utf-8"><style>
     html,body{margin:0;background:transparent;color:#eef2fa;font:13px ui-monospace,Consolas,monospace}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:2px}
+    .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:2px}
     .heading{font:600 13px system-ui;margin:0 0 9px;color:#dde8f8}
     .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#171e2c;
-      border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box}
+      border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;line-height:1.65;font:12.5px ui-monospace,Consolas,monospace}
     .missing{color:#ff8a8a;font-weight:600}.excluded{color:#8796ad}
     .matched{color:#d9e9dc}.normal{color:#e1e7f0}
@@ -1262,48 +1262,47 @@ def review_popup(session_prefix):
         "verify": "Ctrl + Enter",
         "verify_all": "Skip remaining items after confirmation",
     }
+    # Keep controls above the RIGHT panel only. The empty left toolbar cell
+    # balances vertical space so both preview panels begin at one baseline.
+    toolbar_left, toolbar_right = st.columns([1, 1], gap="medium")
+    with toolbar_left:
+        st.markdown("<div style='height:38px'></div>", unsafe_allow_html=True)
+    with toolbar_right:
+        tool_edit, tool_undo, tool_reset, tool_space = st.columns([1, 1, 1, 1.6], gap="small")
+        with tool_edit:
+            if st.button("Edit" if not item["editing"] else "Editing",
+                         disabled=item["editing"], key=f"edit_{session_prefix}",
+                         help=action_help["edit"], use_container_width=True):
+                st.session_state[edit_text_key] = st.session_state.get(text_key, item["formatted"])
+                st.session_state[edit_maker_key] = st.session_state.get(maker_key, item["manufacturer"])
+                item["editing"] = True
+                st.rerun(scope="fragment")
+        with tool_undo:
+            st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
+                      on_click=_review_undo, args=(session_prefix,),
+                      help=action_help["undo"], use_container_width=True)
+        with tool_reset:
+            st.button("Reset", key=f"reset_{session_prefix}",
+                      on_click=_review_reset, args=(session_prefix,),
+                      help=action_help["reset"], use_container_width=True)
     if item["editing"]:
-        l,r = st.columns(2, gap="medium")
-        with l:
+        left_panel, right_panel = st.columns([1, 1], gap="medium")
+        with left_panel:
             st.markdown("**Original RFQ** · selectable")
-            colored_reference(item["source"], compared, panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0))
-        with r:
-            st.markdown("**Formatted text** · editing")
-            toolbar_cols = st.columns([0.8,0.85,1.05,3.2])
-            with toolbar_cols[0]:
-                if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}", help=action_help["edit"], use_container_width=True):
-                    st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
-                    st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
-                    item["editing"]=True
-                    st.rerun(scope="fragment")
-            with toolbar_cols[1]:
-                st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
-                          on_click=_review_undo, args=(session_prefix,), help=action_help["undo"], use_container_width=True)
-            with toolbar_cols[2]:
-                st.button("Reset", key=f"reset_{session_prefix}",
-                          on_click=_review_reset, args=(session_prefix,), help=action_help["reset"], use_container_width=True)
+            colored_reference(item["source"], compared,
+                              panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0))
+        with right_panel:
+            st.markdown("**Formatted output** · editing")
             if item.get("tabular_pdf"):
                 st.text_input("Description", key=desc_key)
-            st.text_area("Formatted Internal Note", key=edit_text_key, height=REVIEW_PANEL_HEIGHT,
+            st.text_area("Formatted Internal Note", key=edit_text_key,
+                         height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0),
                          label_visibility="collapsed")
             st.text_input("Manufacturer", key=edit_maker_key)
     else:
-        toolbar_cols = st.columns([1.05,0.85,0.9,4.2])
-        with toolbar_cols[0]:
-            if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}", help=action_help["edit"], use_container_width=True):
-                st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
-                st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
-                item["editing"]=True
-                st.rerun(scope="fragment")
-        with toolbar_cols[1]:
-            st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
-                      on_click=_review_undo, args=(session_prefix,), help=action_help["undo"], use_container_width=True)
-        with toolbar_cols[2]:
-            st.button("Reset", key=f"reset_{session_prefix}",
-                      on_click=_review_reset, args=(session_prefix,), help=action_help["reset"], use_container_width=True)
         if item.get("tabular_pdf"):
             st.text_input("Description (first sentence of PDF)", key=desc_key)
-        comparison_html(item["source"], compared, item.get("style","default"), sync,
+        comparison_html(item["source"], compared, item.get("style", "default"), sync,
                         REVIEW_PANEL_HEIGHT + (65 if item.get("tabular_pdf") else 0))
         st.caption("Manufacturer: " + (st.session_state[maker_key] or "Not identified"))
     if issues:
