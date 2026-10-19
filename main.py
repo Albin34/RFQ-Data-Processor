@@ -50,6 +50,15 @@ st.markdown("""<style>
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
 [data-testid="stDialog"] iframe {min-width:0!important;max-width:100%!important;box-sizing:border-box}
 [data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0}
+/* Match native button and selectbox heights in the review navigation. */
+[data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"],
+[data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stDialog"] .stButton button {min-height:42px!important}
+.rfq-review-stat{background:#192436;border:1px solid #344158;border-radius:10px;padding:12px 14px;min-height:94px;box-sizing:border-box}
+.rfq-stat-label{color:#dae2f0;font-size:14px;font-weight:600}
+.rfq-stat-count{color:#f5f8fd;font-size:29px;font-weight:600;line-height:1.4;margin-top:3px}
+.rfq-orange{color:#ffa742!important}.rfq-red{color:#ff6868!important}
+.rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0}
 [data-testid="stDialog"] .stButton button {white-space:nowrap;padding-left:.5rem;padding-right:.5rem}
 .stButton button[kind="primary"] {background:#ef8545;border-color:#ef8545;color:white;border-radius:9px}
 .stButton button {border-radius:9px;min-height:2.35rem}
@@ -1272,9 +1281,12 @@ def review_popup(session_prefix):
     issues = validate_rfq(item["source"], draft, item.get("style","default"), desc)
     critical = sum(x["priority"] == "Critical" for x in issues)
     a,b,c = st.columns([1,1,1])
-    a.metric("Technical warnings",len(issues))
-    b.metric("Critical warnings",critical)
-    c.metric("Remaining",len(queue)-done)
+    with a:
+        st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label rfq-orange">Technical warnings</div><div class="rfq-stat-count rfq-orange">{len(issues)}</div></div>', unsafe_allow_html=True)
+    with b:
+        st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label rfq-red">Critical warnings</div><div class="rfq-stat-count rfq-red">{critical}</div></div>', unsafe_allow_html=True)
+    with c:
+        st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label">Remaining</div><div class="rfq-stat-count">{len(queue)-done}</div></div>', unsafe_allow_html=True)
     scroll_key = f"scrollsync_{session_prefix}"
     st.session_state.setdefault(scroll_key, True)
     sync = st.toggle("Synchronize preview scrolling", key=scroll_key,
@@ -1341,21 +1353,36 @@ def review_popup(session_prefix):
                 st.caption(f"... plus {len(issues)-20} more checks")
     else:
         st.success("No missing labeled technical values detected by the configured rules.")
-    st.markdown("**Navigation and verification**")
-    nav_col, previous_col, next_col = st.columns([2.3,1.1,1.1])
+    # All three controls share the same header row and the same input row.
+    nav_header, previous_header, next_header = st.columns([2.3,1.1,1.1], gap="small")
+    with nav_header:
+        st.markdown("<div class='rfq-nav-label'>Jump to line item</div>", unsafe_allow_html=True)
+    with previous_header:
+        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
+    with next_header:
+        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
+    nav_col, previous_col, next_col = st.columns([2.3,1.1,1.1], gap="small", vertical_alignment="center")
+    def item_option(i):
+        q = queue[i]
+        current_desc = st.session_state.get(f"editable_{session_prefix}_{i}",q["formatted"]) if q.get("editing") else q["formatted"]
+        warnings = validate_rfq(q["source"], current_desc, q.get("style","default"), q.get("desc", ""))
+        severity = (" (🔴 Critical Warning)" if any(w["priority"] == "Critical" for w in warnings)
+                    else " (🟠 Technical Warning)" if warnings else "")
+        status = "✓ Verified" if q["verified"] else "Pending"
+        return f"Line {q['line']} · {status}{severity}"
     with nav_col:
         picked = st.selectbox("Jump to line item", options=list(range(len(queue))), index=position,
-             format_func=lambda i:f"Line {queue[i]['line']} · {'✓ Verified' if queue[i]['verified'] else 'Pending'}",
+             format_func=item_option, label_visibility="collapsed",
              key=f"jump_{session_prefix}_{position}")
         if picked != position:
             _navigate_review(review,session_prefix,picked)
     with previous_col:
-        st.markdown("<div style='height:27px' aria-hidden='true'></div>", unsafe_allow_html=True)
-        if st.button("← Previous",disabled=position==0,key=f"prev_{session_prefix}",use_container_width=True, help=action_help["prev"]):
+        if st.button("← Previous", disabled=position==0, key=f"prev_{session_prefix}",
+                     use_container_width=True, help=action_help["prev"]):
             _navigate_review(review,session_prefix,position-1)
     with next_col:
-        st.markdown("<div style='height:27px' aria-hidden='true'></div>", unsafe_allow_html=True)
-        if st.button("Next →",disabled=position==len(queue)-1,key=f"next_{session_prefix}",use_container_width=True, help=action_help["next"]):
+        if st.button("Next →", disabled=position==len(queue)-1, key=f"next_{session_prefix}",
+                     use_container_width=True, help=action_help["next"]):
             _navigate_review(review,session_prefix,position+1)
     verify_col, skip_col = st.columns([2.1,1])
     with verify_col:
@@ -1391,6 +1418,29 @@ def review_popup(session_prefix):
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
     components.html("""<script>(function(){try{const doc=window.parent.document;
+        if(!doc.__rfqWheelInstalled){doc.__rfqWheelInstalled=true;
+          doc.addEventListener('wheel',function(ev){
+            const modal=doc.querySelector('[data-testid="stDialog"] [role="dialog"]') || doc.querySelector('[role="dialog"]');
+            if(!modal || !modal.contains(ev.target) || ev.ctrlKey)return;
+            // Let scrollable editors, select menus, and preview iframes handle their own wheel events.
+            if(ev.target.closest('textarea,[role="listbox"],[data-baseweb="popover"],iframe'))return;
+            let target=ev.target, innerScrollable=false;
+            while(target && target!==modal){
+              if(target instanceof Element){
+                const cs=window.getComputedStyle(target);
+                if(/auto|scroll/.test(cs.overflowY) && target.scrollHeight>target.clientHeight+2){innerScrollable=true;break;}
+              }
+              target=target.parentElement;
+            }
+            if(innerScrollable)return;
+            const options=[modal,...modal.querySelectorAll('[data-testid="stDialogContent"],section')];
+            const scroller=options.find(x=>x.scrollHeight>x.clientHeight+4);
+            if(!scroller)return;
+            const before=scroller.scrollTop;
+            scroller.scrollTop+=ev.deltaY;
+            if(scroller.scrollTop!==before)ev.preventDefault();
+          },{passive:false});
+        }
         if(doc.__rfqKeysInstalled)return;doc.__rfqKeysInstalled=true;
         doc.addEventListener('keydown',function(ev){
           if(ev.target.closest('textarea,input,[contenteditable=true]'))return;
