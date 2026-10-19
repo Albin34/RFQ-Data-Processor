@@ -31,7 +31,20 @@ st.markdown("""<style>
   width:min(1200px,94vw)!important;max-width:94vw!important;
   box-sizing:border-box!important;
 }
-[data-testid="stDialog"] [role="dialog"] {overflow-x:hidden!important;}
+/* Hide only the redundant OUTER modal scrollbar; keep modal wheel/touch
+   scrolling operational and retain both inner RFQ text-panel scrollbars. */
+[data-testid="stDialog"] [role="dialog"],
+[data-testid="stDialog"] [data-testid="stDialogContent"] {
+  overflow-x:hidden!important;
+  scrollbar-width:none!important;
+  -ms-overflow-style:none!important;
+}
+[data-testid="stDialog"] [role="dialog"]::-webkit-scrollbar,
+[data-testid="stDialog"] [data-testid="stDialogContent"]::-webkit-scrollbar {
+  width:0!important;
+  height:0!important;
+  display:none!important;
+}
 [data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.55rem;min-width:0}
 [data-testid="stDialog"] [data-testid="column"],
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
