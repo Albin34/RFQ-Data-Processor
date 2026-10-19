@@ -16,6 +16,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from PyPDF2 import PdfReader
 try:
     import fitz  # PyMuPDF: layout-aware extraction for tabular RFQ PDFs
@@ -1037,14 +1039,14 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#171e2c;
       border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;line-height:1.65;font:12.5px ui-monospace,Consolas,monospace}
-    .missing{color:#ff8a8a;font-weight:600}.excluded{color:#8796ad}
-    .matched{color:#d9e9dc}.normal{color:#e1e7f0}
+    .missing{color:#ff8a8a;font-weight:600}.excluded{color:#69c9ff}
+    .matched{color:#b5ffb9}.normal{color:#e1e7f0}
     .legend{font:12px system-ui;color:#a6b6cb;margin:8px 0 0}
     @media(max-width:620px){.grid{grid-template-columns:1fr}.panel{height:240px}}
     </style></head><body><div class="grid">
     <div><div class="heading">Original RFQ · selectable</div><div id="src" class="panel"><pre>LEFT</pre></div></div>
     <div><div class="heading">Formatted output · preview</div><div id="dst" class="panel"><pre>RIGHT</pre></div></div>
-    </div><div class="legend">Red: review for omission · Grey: intentionally excluded / empty · Pale green: retained · MODE</div>
+    </div><div class="legend">Red: review for omission · Light blue: intentionally excluded / empty · Bright green: retained · MODE</div>
     <script>const a=document.getElementById('src'),b=document.getElementById('dst');
     let lock=false;const synced=SYNC;
     function follow(from,to){if(!synced||lock)return;lock=true;
@@ -1079,6 +1081,22 @@ def _navigate_review(review, prefix, new_position):
     st.rerun(scope="fragment")
 
 
+def space_after_initial_section_header(text):
+    """Use one blank line after an initial PO/Basic/Classification/MPN/Inspection header.
+
+    Only the generated Working Sheet draft is changed. Original RFQ and
+    Uploading Sheet text remain untouched.
+    """
+    text = str(text or "")
+    return re.sub(
+        r"\A(\s*(?:(?:Basic Data|Classification|MPN|Inspection|Material PO|PO Material|Purchase Order)\s+Text)\s*:)\s*\n+",
+        lambda m: m.group(1) + "\n\n",
+        text,
+        count=1,
+        flags=re.I,
+    )
+
+
 def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
     if not records:
@@ -1094,6 +1112,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
                                    if format_style == "tabular_pdf"
                                    else summarize_nawah_working_note(note) if format_style in ("nawah_pdf", "nawah_excel")
                                    else process_rfq_text(note))
+        formatted = space_after_initial_section_header(formatted)
         is_table = format_style == "tabular_pdf"
         # On this PDF layout the first line is the description. Show that full
         # original item in the left reference, but keep PO Text separate for export.
@@ -1124,6 +1143,52 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
         st.session_state.pop(f"{session_prefix}_upload_bytes", None)
 
 
+# Bold emphasis in Working Sheet only. **markers** entered via Ctrl+B are
+# translated to actual Excel rich text; no literal Markdown is exported.
+BOLD_TECHNICAL_LINE = re.compile(
+    r"^\s*(?:manufacturer(?:\s+part)?\s+(?:number|name)|"
+    r"manufacturer\s*[:：]|mfr\.?\s*[:：]|"
+    r"mfg\s*[:：]|make\s*[:：]|"
+    r"part\s*(?:no\.?|number)\s*[:：]|"
+    r"(?:mfr|oem|smg|supplier)\s+part\s*(?:no\.?|number)\s*[:：])",
+    re.I,
+)
+BOLD_MARKERS = re.compile(r"\*\*(.+?)\*\*", re.S)
+
+
+def plain_review_text(text):
+    """Strip explicit bold markers only; leave source values untouched."""
+    return str(text).replace("**", "")
+
+
+def working_sheet_rich_text(text):
+    """Turn manual emphasis and manufacturer/part-number lines into Excel runs."""
+    source = str(text or "")
+    segments = []
+    for line in source.splitlines(keepends=True):
+        auto_bold = bool(BOLD_TECHNICAL_LINE.match(line))
+        cursor = 0
+        for match in BOLD_MARKERS.finditer(line):
+            if match.start() > cursor:
+                segments.append((line[cursor:match.start()], auto_bold))
+            segments.append((match.group(1), not auto_bold))
+            cursor = match.end()
+        if cursor < len(line):
+            segments.append((line[cursor:], auto_bold))
+    if not segments:
+        return source
+    # Preserve the template's base font; only set bold on the rich-text runs.
+    result = CellRichText()
+    for value, is_bold in segments:
+        if not value:
+            continue
+        if is_bold:
+            result.append(TextBlock(InlineFont(b=True, rFont="Aptos Narrow"), value))
+        else:
+            result.append(value)
+    return result
+
+
 def finalize_verified(session_prefix):
     review = st.session_state[f"{session_prefix}_review"]
     queue = review["queue"]
@@ -1142,7 +1207,7 @@ def finalize_verified(session_prefix):
     for i, item in enumerate(queue, 2):
         for col, value in {
             "A": item["line"], "B": item["desc"], "C": item["qty"],
-            "D": item["uom"], "E": item["formatted"],
+            "D": item["uom"], "E": working_sheet_rich_text(item["formatted"]),
             "G": item["manufacturer"],
         }.items():
             sheet[f"{col}{i}"] = value
@@ -1204,8 +1269,8 @@ def colored_reference(original, formatted, panel_height=None, format_style="defa
             cls = "excluded"
         style = {
             "missing": "color:#ff8a8a;font-weight:600",
-            "excluded": "color:#8796ad",
-            "matched": "color:#d9e9dc",
+            "excluded": "color:#69c9ff",
+            "matched": "color:#b5ffb9",
             "normal": "color:#e1e7f0",
         }.get(cls, "color:#e1e7f0")
         highlighted_lines.append(
@@ -1309,8 +1374,8 @@ def review_popup(session_prefix):
     draft = (st.session_state.get(edit_text_key, item["formatted"]) if item["editing"]
              else st.session_state.get(text_key, item["formatted"]))
     desc = st.session_state.get(desc_key, item["desc"]) if item.get("tabular_pdf") else ""
-    compared = (desc + "\n" + draft).strip() if item.get("tabular_pdf") else draft
-    issues = validate_rfq(item["source"], draft, item.get("style","default"), desc)
+    compared = (desc + "\n" + plain_review_text(draft)).strip() if item.get("tabular_pdf") else plain_review_text(draft)
+    issues = validate_rfq(item["source"], plain_review_text(draft), item.get("style","default"), desc)
     critical = sum(x["priority"] == "Critical" for x in issues)
     a,b,c = st.columns([1,1,1])
     with a:
@@ -1371,7 +1436,9 @@ def review_popup(session_prefix):
                 st.text_input("Description", key=desc_key)
             st.text_area("Formatted Internal Note", key=edit_text_key,
                          height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0),
-                         label_visibility="collapsed")
+                         label_visibility="collapsed",
+                         help="Select any text and press Ctrl+B to toggle bold in the Working Sheet. **markers** are converted into Excel formatting.")
+            st.caption("Ctrl+B: select text to toggle bold for the Working Sheet. Manufacturer and part-number lines are bold automatically.")
             st.text_input("Manufacturer", key=edit_maker_key)
     else:
         if item.get("tabular_pdf"):
@@ -1395,7 +1462,7 @@ def review_popup(session_prefix):
     def item_option(i):
         q = queue[i]
         current_desc = st.session_state.get(f"editable_{session_prefix}_{i}", q["formatted"]) if q.get("editing") else q["formatted"]
-        warnings = validate_rfq(q["source"], current_desc, q.get("style", "default"), q.get("desc", ""))
+        warnings = validate_rfq(q["source"], plain_review_text(current_desc), q.get("style", "default"), q.get("desc", ""))
         severity = (" (🔴 Critical Warning)" if any(w["priority"] == "Critical" for w in warnings)
                     else " (🟠 Technical Warning)" if warnings else "")
         status = "✓ Verified" if q["verified"] else "Pending"
@@ -1453,6 +1520,26 @@ def review_popup(session_prefix):
     components.html("""<script>(function(){try{const doc=window.parent.document;
         if(doc.__rfqKeysInstalled)return;doc.__rfqKeysInstalled=true;
         doc.addEventListener('keydown',function(ev){
+          if(ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key.toLowerCase()==='b'){
+            const box=ev.target;
+            if(box.tagName==='TEXTAREA' && box.closest('[role=dialog]')){
+              const selected=box.value.substring(box.selectionStart,box.selectionEnd);
+              if(!selected)return;
+              ev.preventDefault();
+              const start=box.selectionStart,end=box.selectionEnd;
+              const before=box.value.substring(0,start),after=box.value.substring(end);
+              let insert=selected;
+              if(before.endsWith('**') && after.startsWith('**')){
+                box.setRangeText(selected,start-2,end+2,'select');
+              }else if(selected.startsWith('**') && selected.endsWith('**') && selected.length>=4){
+                box.setRangeText(selected.substring(2,selected.length-2),start,end,'select');
+              }else{
+                box.setRangeText('**'+selected+'**',start,end,'select');
+              }
+              box.dispatchEvent(new Event('input',{bubbles:true}));
+              return;
+            }
+          }
           if(ev.target.closest('textarea,input,[contenteditable=true]'))return;
           let label=null;
           if(ev.ctrlKey&&ev.key==='Enter')label='Verify &';
