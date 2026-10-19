@@ -67,7 +67,7 @@ st.markdown("""<style>
 .rfq-stat-label{color:#dae2f0;font-size:14px;font-weight:600}
 .rfq-stat-count{color:#f5f8fd;font-size:25px;font-weight:600;line-height:1.15;margin-top:3px}
 .rfq-orange{color:#ffa742!important}.rfq-red{color:#ff6868!important}
-.rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0}
+.rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0;position:relative;top:-6px}
 [data-testid="stDialog"] .stButton button {white-space:nowrap;padding-left:.5rem;padding-right:.5rem}
 .stButton button[kind="primary"] {background:#ef8545;border-color:#ef8545;color:white;border-radius:9px}
 .stButton button {border-radius:9px;min-height:2.35rem}
