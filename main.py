@@ -58,7 +58,7 @@ st.markdown("""<style>
 [data-testid="stDialog"] iframe {min-width:0!important;max-width:100%!important;box-sizing:border-box}
 [data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0;overflow:visible!important}
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] {overflow:visible!important}
-[data-testid="stDialog"] [role="dialog"] {scroll-padding-bottom:110px}
+[data-testid="stDialog"] [role="dialog"] {scroll-padding-bottom:14px}
 /* Match native button and selectbox heights in review navigation. */
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"],
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
@@ -1154,7 +1154,7 @@ def _comparison_line(line):
     return re.sub(r"\s+", "", line).casefold()
 
 
-REVIEW_PANEL_HEIGHT = 250
+REVIEW_PANEL_HEIGHT = 335
 
 
 def _review_panel(body, *, empty_label="(No text)", panel_height=None):
@@ -1365,37 +1365,34 @@ def review_popup(session_prefix):
                 st.caption(f"... plus {len(issues)-20} more checks")
     else:
         st.success("No missing labeled technical values detected by the configured rules.")
-    # All three controls share the same header row and the same input row.
-    nav_header, previous_header, next_header = st.columns([2.3,1.1,1.1], gap="small")
-    with nav_header:
-        st.markdown("<div class='rfq-nav-label'>Jump to line item</div>", unsafe_allow_html=True)
-    with previous_header:
-        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
-    with next_header:
-        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
-    nav_col, previous_col, next_col = st.columns([2.3,1.1,1.1], gap="small", vertical_alignment="center")
+    # Navigation controls must share a single row: separate Streamlit column
+    # rows can differ in height and misalign the dropdown and buttons.
+    nav_col, previous_col, next_col = st.columns([2.3, 1.1, 1.1], gap="small")
     def item_option(i):
         q = queue[i]
-        current_desc = st.session_state.get(f"editable_{session_prefix}_{i}",q["formatted"]) if q.get("editing") else q["formatted"]
-        warnings = validate_rfq(q["source"], current_desc, q.get("style","default"), q.get("desc", ""))
+        current_desc = st.session_state.get(f"editable_{session_prefix}_{i}", q["formatted"]) if q.get("editing") else q["formatted"]
+        warnings = validate_rfq(q["source"], current_desc, q.get("style", "default"), q.get("desc", ""))
         severity = (" (🔴 Critical Warning)" if any(w["priority"] == "Critical" for w in warnings)
                     else " (🟠 Technical Warning)" if warnings else "")
         status = "✓ Verified" if q["verified"] else "Pending"
         return f"Line {q['line']} · {status}{severity}"
     with nav_col:
+        st.markdown("<div class='rfq-nav-label'>Jump to line item</div>", unsafe_allow_html=True)
         picked = st.selectbox("Jump to line item", options=list(range(len(queue))), index=position,
              format_func=item_option, label_visibility="collapsed",
              key=f"jump_{session_prefix}_{position}")
         if picked != position:
-            _navigate_review(review,session_prefix,picked)
+            _navigate_review(review, session_prefix, picked)
     with previous_col:
-        if st.button("← Previous", disabled=position==0, key=f"prev_{session_prefix}",
+        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
+        if st.button("← Previous", disabled=position == 0, key=f"prev_{session_prefix}",
                      use_container_width=True, help=action_help["prev"]):
-            _navigate_review(review,session_prefix,position-1)
+            _navigate_review(review, session_prefix, position - 1)
     with next_col:
-        if st.button("Next →", disabled=position==len(queue)-1, key=f"next_{session_prefix}",
+        st.markdown("<div class='rfq-nav-label'>&nbsp;</div>", unsafe_allow_html=True)
+        if st.button("Next →", disabled=position == len(queue) - 1, key=f"next_{session_prefix}",
                      use_container_width=True, help=action_help["next"]):
-            _navigate_review(review,session_prefix,position+1)
+            _navigate_review(review, session_prefix, position + 1)
     verify_col, skip_col = st.columns([2.1,1])
     with verify_col:
         if st.button("Verify & Next" if position+1<len(queue) else "Verify & Finish",type="primary",
@@ -1427,10 +1424,6 @@ def review_popup(session_prefix):
             review["confirm_all"]=True
             st.rerun()
     st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
-    # Leave breathing room at the bottom of the scrollable dialog so the
-    # line-item selector and verification controls are not clipped against
-    # the modal's lower edge on smaller laptop screens.
-    st.markdown("<div style='height:76px' aria-hidden='true'></div>", unsafe_allow_html=True)
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
     components.html("""<script>(function(){try{const doc=window.parent.document;
