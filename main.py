@@ -1294,6 +1294,9 @@ def review_popup(session_prefix):
         st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label rfq-red">Critical warnings</div><div class="rfq-stat-count rfq-red">{critical}</div></div>', unsafe_allow_html=True)
     with c:
         st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label">Remaining</div><div class="rfq-stat-count">{len(queue)-done}</div></div>', unsafe_allow_html=True)
+    # Separate the warning cards from the scrolling toggle. Streamlit Markdown
+    # blocks may size slightly shorter than their internal card on some browsers.
+    st.markdown('<div style="height:16px;clear:both" aria-hidden="true"></div>', unsafe_allow_html=True)
     scroll_key = f"scrollsync_{session_prefix}"
     st.session_state.setdefault(scroll_key, True)
     sync = st.toggle("Synchronize preview scrolling", key=scroll_key,
