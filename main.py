@@ -25,30 +25,36 @@ except ImportError:
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stApp {background:linear-gradient(160deg,#0d1220,#111827 52%,#0d1421)}
-/* One fixed-width dialog: no nested page scrolling or unused right gutter. */
+/* Restore native popup scrolling. One scroll host uses the full dialog width. */
 [data-testid="stDialog"] [role="dialog"] {
   width:min(1180px, calc(100vw - 24px))!important;
   max-width:calc(100vw - 24px)!important;
   max-height:calc(100dvh - 20px)!important;
   overflow:hidden!important;
   box-sizing:border-box!important;
+  padding:0!important;
 }
 [data-testid="stDialog"] [data-testid="stDialogContent"] {
   width:100%!important;
+  min-width:0!important;
   max-width:100%!important;
-  height:100%!important;
-  overflow:hidden!important;
+  max-height:calc(100dvh - 20px)!important;
+  height:auto!important;
+  overflow-x:hidden!important;
+  overflow-y:auto!important;
+  overscroll-behavior-y:contain;
+  scrollbar-gutter:auto!important;
   box-sizing:border-box!important;
-  padding-right:1rem!important;
+  padding:1rem 1.1rem!important;
 }
-/* Depending on Streamlit version, the internal block is the scroll host. */
 [data-testid="stDialog"] [data-testid="stDialogContent"] > div {
+  min-width:0!important;
   max-width:100%!important;
   overflow:visible!important;
   box-sizing:border-box!important;
 }
-[data-testid="stDialog"] [role="dialog"]::-webkit-scrollbar,
-[data-testid="stDialog"] [data-testid="stDialogContent"]::-webkit-scrollbar {display:none!important}
+/* Keep the genuine outer scrollbar available; do not reserve a blank rail. */
+[data-testid="stDialog"] [data-testid="stDialogContent"] {scrollbar-width:thin}
 [data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.55rem;min-width:0}
 [data-testid="stDialog"] [data-testid="column"],
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
