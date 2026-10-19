@@ -25,8 +25,19 @@ except ImportError:
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stApp {background:linear-gradient(160deg,#0d1220,#111827 52%,#0d1421)}
-[data-testid="stDialog"] [role="dialog"] {max-width:min(1480px,97vw)!important;width:97vw!important}
-[data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.65rem}
+/* Size the actual modal rather than stretching its children beyond the viewport. */
+[data-testid="stDialog"] [role="dialog"],
+[data-testid="stDialog"] [data-testid="stDialogContent"] {
+  width:min(1200px,94vw)!important;max-width:94vw!important;
+  box-sizing:border-box!important;
+}
+[data-testid="stDialog"] [role="dialog"] {overflow-x:hidden!important;}
+[data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.55rem;min-width:0}
+[data-testid="stDialog"] [data-testid="column"],
+[data-testid="stDialog"] [data-testid="stHorizontalBlock"],
+[data-testid="stDialog"] iframe {min-width:0!important;max-width:100%!important;box-sizing:border-box}
+[data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0}
+[data-testid="stDialog"] .stButton button {white-space:nowrap;padding-left:.5rem;padding-right:.5rem}
 .stButton button[kind="primary"] {background:#ef8545;border-color:#ef8545;color:white;border-radius:9px}
 .stButton button {border-radius:9px;min-height:2.35rem}
 [data-testid="stFileUploader"] {border-radius:12px}
@@ -970,7 +981,9 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     right = html.escape(formatted)
     document = """<!doctype html><html><head><meta charset="utf-8"><style>
     html,body{margin:0;background:transparent;color:#eef2fa;font:13px ui-monospace,Consolas,monospace}
-    .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:2px}
+    *{box-sizing:border-box}
+    .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;padding:2px;width:100%;max-width:100%;overflow:hidden}
+    .grid>div{min-width:0;max-width:100%;overflow:hidden}
     .heading{font:600 13px system-ui;margin:0 0 9px;color:#dde8f8}
     .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#171e2c;
       border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
@@ -992,7 +1005,7 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     </script></body></html>"""
     document = document.replace('HEIGHT', str(height)).replace('RIGHT',right).replace('LEFT',left)
     document = document.replace('SYNC', 'true' if sync else 'false').replace('MODE', 'Synchronized scroll' if sync else 'Independent scroll')
-    components.html(document, height=height + 72, scrolling=False)
+    components.html(document, height=height + 62, scrolling=False, width=None)
     return stats
 
 
@@ -1110,7 +1123,7 @@ def _comparison_line(line):
     return re.sub(r"\s+", "", line).casefold()
 
 
-REVIEW_PANEL_HEIGHT = 510
+REVIEW_PANEL_HEIGHT = 400
 
 
 def _review_panel(body, *, empty_label="(No text)", panel_height=None):
@@ -1324,9 +1337,11 @@ def review_popup(session_prefix):
         if picked != position:
             _navigate_review(review,session_prefix,picked)
     with previous_col:
+        st.markdown("<div style='height:27px' aria-hidden='true'></div>", unsafe_allow_html=True)
         if st.button("← Previous",disabled=position==0,key=f"prev_{session_prefix}",use_container_width=True, help=action_help["prev"]):
             _navigate_review(review,session_prefix,position-1)
     with next_col:
+        st.markdown("<div style='height:27px' aria-hidden='true'></div>", unsafe_allow_html=True)
         if st.button("Next →",disabled=position==len(queue)-1,key=f"next_{session_prefix}",use_container_width=True, help=action_help["next"]):
             _navigate_review(review,session_prefix,position+1)
     verify_col, skip_col = st.columns([2.1,1])
