@@ -1253,19 +1253,54 @@ def review_popup(session_prefix):
     st.session_state.setdefault(scroll_key, True)
     sync = st.toggle("Synchronize preview scrolling", key=scroll_key,
                      help="Applies to the read-only two-panel comparison. During editing, the editor scrolls independently.")
+    action_help = {
+        "edit": "Ctrl + E",
+        "undo": "Undo last saved change",
+        "reset": "Restore the original Python-formatted draft",
+        "prev": "Alt + ←",
+        "next": "Alt + →",
+        "verify": "Ctrl + Enter",
+        "verify_all": "Skip remaining items after confirmation",
+    }
     if item["editing"]:
         l,r = st.columns(2, gap="medium")
         with l:
             st.markdown("**Original RFQ** · selectable")
             colored_reference(item["source"], compared, panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0))
         with r:
+            st.markdown("**Formatted text** · editing")
+            toolbar_cols = st.columns([0.8,0.85,1.05,3.2])
+            with toolbar_cols[0]:
+                if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}", help=action_help["edit"], use_container_width=True):
+                    st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
+                    st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
+                    item["editing"]=True
+                    st.rerun(scope="fragment")
+            with toolbar_cols[1]:
+                st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
+                          on_click=_review_undo, args=(session_prefix,), help=action_help["undo"], use_container_width=True)
+            with toolbar_cols[2]:
+                st.button("Reset", key=f"reset_{session_prefix}",
+                          on_click=_review_reset, args=(session_prefix,), help=action_help["reset"], use_container_width=True)
             if item.get("tabular_pdf"):
                 st.text_input("Description", key=desc_key)
-            st.markdown("**Formatted text** · editing")
             st.text_area("Formatted Internal Note", key=edit_text_key, height=REVIEW_PANEL_HEIGHT,
                          label_visibility="collapsed")
             st.text_input("Manufacturer", key=edit_maker_key)
     else:
+        toolbar_cols = st.columns([1.05,0.85,0.9,4.2])
+        with toolbar_cols[0]:
+            if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}", help=action_help["edit"], use_container_width=True):
+                st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
+                st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
+                item["editing"]=True
+                st.rerun(scope="fragment")
+        with toolbar_cols[1]:
+            st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
+                      on_click=_review_undo, args=(session_prefix,), help=action_help["undo"], use_container_width=True)
+        with toolbar_cols[2]:
+            st.button("Reset", key=f"reset_{session_prefix}",
+                      on_click=_review_reset, args=(session_prefix,), help=action_help["reset"], use_container_width=True)
         if item.get("tabular_pdf"):
             st.text_input("Description (first sentence of PDF)", key=desc_key)
         comparison_html(item["source"], compared, item.get("style","default"), sync,
@@ -1281,8 +1316,8 @@ def review_popup(session_prefix):
                 st.caption(f"... plus {len(issues)-20} more checks")
     else:
         st.success("No missing labeled technical values detected by the configured rules.")
-    st.markdown("**Navigation and editing**")
-    nav_col, previous_col, next_col = st.columns([2,1,1])
+    st.markdown("**Navigation and verification**")
+    nav_col, previous_col, next_col = st.columns([2.3,1.1,1.1])
     with nav_col:
         picked = st.selectbox("Jump to line item", options=list(range(len(queue))), index=position,
              format_func=lambda i:f"Line {queue[i]['line']} · {'✓ Verified' if queue[i]['verified'] else 'Pending'}",
@@ -1290,27 +1325,15 @@ def review_popup(session_prefix):
         if picked != position:
             _navigate_review(review,session_prefix,picked)
     with previous_col:
-        if st.button("← Previous",disabled=position==0,key=f"prev_{session_prefix}",use_container_width=True):
+        if st.button("← Previous",disabled=position==0,key=f"prev_{session_prefix}",use_container_width=True, help=action_help["prev"]):
             _navigate_review(review,session_prefix,position-1)
     with next_col:
-        if st.button("Next →",disabled=position==len(queue)-1,key=f"next_{session_prefix}",use_container_width=True):
+        if st.button("Next →",disabled=position==len(queue)-1,key=f"next_{session_prefix}",use_container_width=True, help=action_help["next"]):
             _navigate_review(review,session_prefix,position+1)
-    left, undo_col, reset_col, verify_col, skip_col = st.columns([1,1,1,1.6,1])
-    with left:
-        if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}"):
-            st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
-            st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
-            item["editing"]=True
-            st.rerun(scope="fragment")
-    with undo_col:
-        st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
-                  on_click=_review_undo, args=(session_prefix,))
-    with reset_col:
-        st.button("Reset draft", key=f"reset_{session_prefix}",
-                  on_click=_review_reset, args=(session_prefix,))
+    verify_col, skip_col = st.columns([2.1,1])
     with verify_col:
         if st.button("Verify & Next" if position+1<len(queue) else "Verify & Finish",type="primary",
-                     key=f"verify_{session_prefix}",use_container_width=True):
+                     key=f"verify_{session_prefix}",use_container_width=True, help=action_help["verify"]):
             updated = (st.session_state.get(edit_text_key,draft) if item["editing"] else st.session_state[text_key]).strip()
             new_desc = st.session_state.get(desc_key,item["desc"]).strip() if item.get("tabular_pdf") else item["desc"]
             if item.get("tabular_pdf") and not new_desc:
@@ -1333,7 +1356,7 @@ def review_popup(session_prefix):
                     review["position"]=next((i for i in pending if i>position),pending[0])
                     st.rerun(scope="fragment")
     with skip_col:
-        if st.button("Verify All",key=f"verify_all_{session_prefix}"):
+        if st.button("Verify All",key=f"verify_all_{session_prefix}", use_container_width=True, help=action_help["verify_all"]):
             _save_current(review,session_prefix)
             review["confirm_all"]=True
             st.rerun()
