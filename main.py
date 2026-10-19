@@ -68,6 +68,24 @@ st.markdown("""<style>
 .rfq-stat-count{color:#f5f8fd;font-size:25px;font-weight:600;line-height:1.15;margin-top:3px}
 .rfq-orange{color:#ffa742!important}.rfq-red{color:#ff6868!important}
 .rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0;position:relative;top:-6px}
+/* Make Streamlit's editable field visually match the read-only comparison. */
+[data-testid="stDialog"] [data-testid="stTextArea"] textarea {
+  background:#171e2c!important;
+  color:#e1e7f0!important;
+  border:1px solid #3b465a!important;
+  border-radius:12px!important;
+  font-family:ui-monospace,Consolas,monospace!important;
+  font-size:12.5px!important;
+  line-height:1.65!important;
+  padding:14px!important;
+  overflow-wrap:anywhere!important;
+  white-space:pre-wrap!important;
+  resize:none!important;
+}
+[data-testid="stDialog"] [data-testid="stTextArea"] textarea:focus {
+  outline:1px solid #54769f!important;
+  box-shadow:none!important;
+}
 [data-testid="stDialog"] .stButton button {white-space:nowrap;padding-left:.5rem;padding-right:.5rem}
 .stButton button[kind="primary"] {background:#ef8545;border-color:#ef8545;color:white;border-radius:9px}
 .stButton button {border-radius:9px;min-height:2.35rem}
@@ -1173,20 +1191,25 @@ def _review_panel(body, *, empty_label="(No text)", panel_height=None):
     )
 
 
-def colored_reference(original, formatted, panel_height=None):
-    """Original text with preserved whitespace and red unmatched lines."""
-    formatted_lines = [_comparison_line(x) for x in formatted.splitlines() if x.strip()]
+def colored_reference(original, formatted, panel_height=None, format_style="default"):
+    """Use the same source-line classification as non-editing preview."""
     highlighted_lines = []
+    in_quality = False
     for line in original.splitlines():
-        token = _comparison_line(line)
-        matched = not token or any(
-            token == candidate or (len(token) > 16 and token in candidate)
-            for candidate in formatted_lines
-        )
-        safe_line = html.escape(line)
-        if not matched:
-            safe_line = f'<span style="color:#ff7373;font-weight:600">{safe_line}</span>'
-        highlighted_lines.append(safe_line)
+        if format_style.startswith("nawah") and re.match(
+                r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
+            in_quality = True
+        cls = _classification(line, formatted, format_style)
+        if in_quality and format_style.startswith("nawah") and cls == "missing":
+            cls = "excluded"
+        style = {
+            "missing": "color:#ff8a8a;font-weight:600",
+            "excluded": "color:#8796ad",
+            "matched": "color:#d9e9dc",
+            "normal": "color:#e1e7f0",
+        }.get(cls, "color:#e1e7f0")
+        highlighted_lines.append(
+            f'<span style="{style}">{html.escape(line)}</span>')
     content = "\n".join(highlighted_lines)
     if original.endswith("\n"):
         content += "\n"
@@ -1340,7 +1363,8 @@ def review_popup(session_prefix):
         with left_panel:
             st.markdown("**Original RFQ** · selectable")
             colored_reference(item["source"], compared,
-                              panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0))
+                              panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0),
+                              format_style=item.get("style", "default"))
         with right_panel:
             st.markdown("**Formatted output** · editing")
             if item.get("tabular_pdf"):
