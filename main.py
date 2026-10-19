@@ -6,6 +6,8 @@ import re
 import csv
 import html
 import traceback
+from collections import Counter
+import streamlit.components.v1 as components
 from collections import defaultdict
 from copy import copy
 from io import BytesIO
@@ -22,8 +24,13 @@ except ImportError:
 
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
-.stButton button {background:#ff914d;color:white;border-radius:8px;padding:10px 16px;margin-top:10px}
-.stExpander {border-radius:10px}
+.stApp {background:linear-gradient(160deg,#0d1220,#111827 52%,#0d1421)}
+[data-testid="stDialog"] [role="dialog"] {max-width:min(1480px,97vw)!important;width:97vw!important}
+[data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.65rem}
+.stButton button[kind="primary"] {background:#ef8545;border-color:#ef8545;color:white;border-radius:9px}
+.stButton button {border-radius:9px;min-height:2.35rem}
+[data-testid="stFileUploader"] {border-radius:12px}
+[data-testid="stMetric"] {background:#192436;border:1px solid #344158;border-radius:10px;padding:8px 12px}
 </style>""", unsafe_allow_html=True)
 
 # All formatting is performed locally by deterministic Python rules.
@@ -849,6 +856,167 @@ def format_dubai_petroleum_note(source):
     return "\n".join(output).strip(), ""
 
 
+# RFQ checks are advisory; the original source always remains authoritative.
+VALIDATION_LABELS = re.compile(
+    r"^(?:MFR|MFG|MANUFACTURER(?: NAME| NUMBER| PART NUMBER)?|PART(?: NUMBER| NO)?|"
+    r"MPN|OEM(?: PART| MODEL| SERIAL)?(?: NUMBER)?|MODEL(?: NUMBER)?|"
+    r"DRAWING(?: NUMBER| NO)?|TAG(?: NUMBER| NO| NOS)?|"
+    r"MATERIAL|GRADE|STANDARD|SIZE(?: [A-Z])?|THICKNESS|DIAMETER|LENGTH|"
+    r"PRESSURE(?: RATING| RANGE)?|RANGE|TEMPERATURE(?: RATING)?|VOLTAGE|"
+    r"POWER(?: SUPPLY| RATING)?|CONNECTION|CLASS(?: RATING)?|"
+    r"FLOW(?: RATING)?|CAPACITY|ACCURACY|RATED VOLTAGE)\s*:\s*(.+)$", re.I)
+VALIDATION_EMPTY = {"", "-", "--", "---", "N/A", "NONE", "NULL"}
+CRITICAL_FIELD = re.compile(r"MFR|MANUFACTURER|PART|MPN|OEM|MODEL|DRAWING|TAG", re.I)
+NUMBER_TOKEN = re.compile(r"(?<![A-Za-z])(?:\d+(?:[.,]\d+)*(?:/\d+)?)(?:\s*(?:MM|CM|IN|INCH|BAR|PSI|VAC|VDC|V|HZ|RPM|DEG|°C|°F|KG|LPM))?", re.I)
+
+def compare_normalize(value):
+    value = normalize_pdf_symbols(str(value)).casefold()
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+def _multiset_contains(original, formatted):
+    return compare_normalize(original) in compare_normalize(formatted)
+
+def validate_rfq(source, draft, format_style="default", description=""):
+    """Check labeled technical fields, numbers and certificate deliverables.
+
+    Do not flag omitted source sections for Nawah that are intentionally
+    summarized. The warnings are review aids, never claims of full compliance.
+    """
+    source = str(source or "")
+    draft = str(draft or "")
+    if format_style == "tabular_pdf" and description:
+        draft = description + "\n" + draft
+    src = source.splitlines()
+    cut = next((i for i, line in enumerate(src) if re.search(r"^\s*(?:QUALITY REQUIREMENTS?\s*:?|START OF MESSAGE CODE)", line, re.I)), len(src)) if format_style.startswith("nawah") else len(src)
+    check_lines = src[:cut]
+    warnings = []
+    seen = set()
+    for line in check_lines:
+        match = VALIDATION_LABELS.match(line.strip())
+        if not match:
+            continue
+        label, value = match.group(0).split(":", 1)
+        value = value.strip()
+        if value.upper() in VALIDATION_EMPTY:
+            continue
+        # Check the technical value, allowing label changes and spaces/punctuation.
+        if not _multiset_contains(value, draft):
+            priority = "Critical" if CRITICAL_FIELD.search(label) else "Review"
+            signature = (label.upper(), value)
+            if signature not in seen:
+                warnings.append({"priority":priority,"field":label.strip(),"value":value,
+                                 "message":"Technical value not found in formatted text"})
+                seen.add(signature)
+    # For complex narrative, compare digit-bearing identifiers outside recognized
+    # fields. Ignore boilerplate separators and skip this check in Nawah source QA.
+    number_source = "\n".join(line for line in check_lines if not VALIDATION_LABELS.match(line.strip()))
+    for token in NUMBER_TOKEN.findall(number_source):
+        if len(compare_normalize(token)) < 3:
+            continue
+        if not _multiset_contains(token, draft) and len(warnings) < 35:
+            key = ("numeric",compare_normalize(token))
+            if key not in seen:
+                warnings.append({"priority":"Review", "field":"Number / unit", "value":token.strip(),
+                                 "message":"Number or unit may be missing or changed"})
+                seen.add(key)
+    if format_style.startswith("nawah"):
+        # Explicit certificate requirements must survive the shortened QA section.
+        requirements = [
+            (r"Z_NPE_CERT OF CONFORMANCE", "CERTIFICATE OF CONFORMANCE"),
+            (r"Z_NPE_CERT OF COMPLIANCE", "CERTIFICATE OF COMPLIANCE"),
+            (r"Z_NPE_CERT OF CONFORMITY", "CERTIFICATE OF CONFORMITY"),
+            (r"Z_NPE_CODE CMTR", "CERTIFIED MATERIAL TEST REPORT"),
+            (r"Z_NPE_CMTR", "MATERIAL TEST REPORT"),
+            (r"Z_NPE_CODE DATA REPORT", "CODE DATA REPORT"),
+            (r"Z_NPE_CODE RECONCILIATION", "CODE RECONCILIATION"),
+        ]
+        for pattern, name in requirements:
+            if re.search(pattern, source, re.I) and name.casefold() not in draft.casefold():
+                warnings.append({"priority":"Critical", "field":"Quality requirement", "value":name,
+                                 "message":"Required documentation may be missing"})
+    return warnings
+
+
+def _classification(line, draft, format_style):
+    val = line.strip()
+    if not val:
+        return "normal"
+    if re.fullmatch(r"[-*=_#. ~]{4,}", val):
+        return "excluded"
+    if format_style.startswith("nawah") and re.search(r"COMMERCIAL QA|AUGMENTED QUALITY|GENERAL PACKAGING|START OF MESSAGE CODE|END OF MESSAGE CODE", val, re.I):
+        return "excluded"
+    if re.match(r"^[\w /().-]+\s*:\s*(?:-+|N/?A)?$", val, re.I) and val.casefold() not in {"characteristics :", "mpn details"}:
+        return "excluded"
+    if _multiset_contains(val, draft):
+        return "matched"
+    return "missing"
+
+
+def comparison_html(original, formatted, style="default", sync=True, height=510):
+    """Both previews live in one iframe, allowing reliable scroll linking."""
+    original_lines = original.splitlines()
+    rendered = []
+    stats = Counter()
+    in_quality = False
+    for line in original_lines:
+        if style.startswith("nawah") and re.match(r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
+            in_quality = True
+        cls = _classification(line, formatted, style)
+        if in_quality and style.startswith("nawah") and cls == "missing":
+            cls = "excluded"  # Nawah quality boilerplate is summarized intentionally.
+        stats[cls] += 1
+        rendered.append('<span class="' + cls + '">' + html.escape(line) + '</span>')
+    left = "\n".join(rendered)
+    right = html.escape(formatted)
+    document = """<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;background:transparent;color:#eef2fa;font:13px ui-monospace,Consolas,monospace}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:2px}
+    .heading{font:600 13px system-ui;margin:0 0 9px;color:#dde8f8}
+    .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#171e2c;
+      border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box}
+    pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;line-height:1.65;font:12.5px ui-monospace,Consolas,monospace}
+    .missing{color:#ff8a8a;font-weight:600}.excluded{color:#8796ad}
+    .matched{color:#d9e9dc}.normal{color:#e1e7f0}
+    .legend{font:12px system-ui;color:#a6b6cb;margin:8px 0 0}
+    @media(max-width:620px){.grid{grid-template-columns:1fr}.panel{height:240px}}
+    </style></head><body><div class="grid">
+    <div><div class="heading">Original RFQ · selectable</div><div id="src" class="panel"><pre>LEFT</pre></div></div>
+    <div><div class="heading">Formatted output · preview</div><div id="dst" class="panel"><pre>RIGHT</pre></div></div>
+    </div><div class="legend">Red: review for omission · Grey: intentionally excluded / empty · Pale green: retained · MODE</div>
+    <script>const a=document.getElementById('src'),b=document.getElementById('dst');
+    let lock=false;const synced=SYNC;
+    function follow(from,to){if(!synced||lock)return;lock=true;
+       let max=Math.max(1,from.scrollHeight-from.clientHeight), target=Math.max(0,to.scrollHeight-to.clientHeight);
+       to.scrollTop=(from.scrollTop/max)*target;to.scrollLeft=from.scrollLeft;lock=false;}
+    a.addEventListener('scroll',()=>follow(a,b));b.addEventListener('scroll',()=>follow(b,a));
+    </script></body></html>"""
+    document = document.replace('HEIGHT', str(height)).replace('RIGHT',right).replace('LEFT',left)
+    document = document.replace('SYNC', 'true' if sync else 'false').replace('MODE', 'Synchronized scroll' if sync else 'Independent scroll')
+    components.html(document, height=height + 72, scrolling=False)
+    return stats
+
+
+def _save_current(review, prefix):
+    pos=review["position"]
+    item=review["queue"][pos]
+    if item.get("editing"):
+        item["formatted"] = st.session_state.get(f"editable_{prefix}_{pos}", item["formatted"])
+        item["manufacturer"] = st.session_state.get(f"editablemaker_{prefix}_{pos}", item["manufacturer"])
+    else:
+        item["formatted"] = st.session_state.get(f"formatted_{prefix}_{pos}", item["formatted"])
+        item["manufacturer"] = st.session_state.get(f"maker_{prefix}_{pos}", item["manufacturer"])
+    if item.get("tabular_pdf"):
+        item["desc"] = st.session_state.get(f"desc_{prefix}_{pos}", item["desc"])
+    st.session_state[f"formatted_{prefix}_{pos}"] = item["formatted"]
+    st.session_state[f"maker_{prefix}_{pos}"] = item["manufacturer"]
+
+
+def _navigate_review(review, prefix, new_position):
+    _save_current(review, prefix)
+    review["position"] = new_position
+    st.rerun(scope="fragment")
+
+
 def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
     if not records:
@@ -871,12 +1039,17 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
         queue.append({"line": line, "desc": desc, "qty": qty, "uom": uom,
                       "source": source, "formatted": formatted,
                       "tabular_pdf": is_table, "manufacturer": manufacturer,
-                      "verified": False, "editing": False})
+                      "verified": False, "editing": False, "style":format_style,
+                      "initial_formatted": formatted, "initial_manufacturer": manufacturer,
+                      "initial_desc": desc, "history": []})
     for old_key in list(st.session_state):
         if old_key.startswith((f"original_{session_prefix}_", f"formatted_{session_prefix}_", f"maker_{session_prefix}_", f"editable_{session_prefix}_", f"editablemaker_{session_prefix}_", f"desc_{session_prefix}_")):
             del st.session_state[old_key]
     st.session_state[f"{session_prefix}_review"] = {
-        "queue": queue, "position": 0, "suffix": suffix,
+        "queue": queue, "position": 0, "suffix": suffix, "format_label": {
+            "dubai_csv":"Dubai Petroleum CSV", "tabular_pdf":"Fertil table PDF",
+            "nawah_pdf":"Nawah PDF", "nawah_excel":"Nawah Excel",
+            "default":"Standard Ariba / ADNOC"}.get(format_style,format_style),
         "template": template_data,
         "upload_bytes": workbook_bytes(upload_wb) if upload_wb is not None else None,
     }
@@ -1013,7 +1186,39 @@ def confirm_verify_all_popup(session_prefix):
             st.rerun()
 
 
-@st.dialog("Verify RFQ line item", width="large")
+def _review_undo(prefix):
+    review = st.session_state[f"{prefix}_review"]
+    pos = review["position"]
+    item = review["queue"][pos]
+    if not item["history"]:
+        return
+    text, maker, desc = item["history"].pop()
+    item.update(formatted=text, manufacturer=maker, desc=desc, verified=False)
+    st.session_state[f"formatted_{prefix}_{pos}"] = text
+    st.session_state[f"maker_{prefix}_{pos}"] = maker
+    st.session_state[f"editable_{prefix}_{pos}"] = text
+    st.session_state[f"editablemaker_{prefix}_{pos}"] = maker
+    if item.get("tabular_pdf"):
+        st.session_state[f"desc_{prefix}_{pos}"] = desc
+
+
+def _review_reset(prefix):
+    review = st.session_state[f"{prefix}_review"]
+    pos = review["position"]
+    item = review["queue"][pos]
+    current = (st.session_state.get(f"editable_{prefix}_{pos}",item["formatted"]) if item["editing"] else item["formatted"])
+    item["history"].append((current, item["manufacturer"],item["desc"]))
+    item.update(formatted=item["initial_formatted"],manufacturer=item["initial_manufacturer"],
+                desc=item["initial_desc"],verified=False)
+    st.session_state[f"formatted_{prefix}_{pos}"] = item["formatted"]
+    st.session_state[f"maker_{prefix}_{pos}"] = item["manufacturer"]
+    st.session_state[f"editable_{prefix}_{pos}"] = item["formatted"]
+    st.session_state[f"editablemaker_{prefix}_{pos}"] = item["manufacturer"]
+    if item.get("tabular_pdf"):
+        st.session_state[f"desc_{prefix}_{pos}"] = item["desc"]
+
+
+@st.dialog("RFQ Quality Review", width="large")
 def review_popup(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
     if not review or review.get("completed"):
@@ -1021,105 +1226,134 @@ def review_popup(session_prefix):
     queue = review["queue"]
     position = review["position"]
     item = queue[position]
-    st.write(f"**Line {item['line']} — item {position + 1} of {len(queue)}**")
-    st.progress(sum(1 for record in queue if record["verified"]) / len(queue))
+    done = sum(q["verified"] for q in queue)
+    st.markdown(f"#### Line {item['line']}  ·  Item {position + 1} of {len(queue)}")
+    st.caption(f"**Detected RFQ format:** {review.get('format_label', 'Unknown')}  ·  {done}/{len(queue)} verified")
+    st.progress(done / len(queue))
     text_key = f"formatted_{session_prefix}_{position}"
     maker_key = f"maker_{session_prefix}_{position}"
-    if text_key not in st.session_state:
-        st.session_state[text_key] = item["formatted"]
-    if maker_key not in st.session_state:
-        st.session_state[maker_key] = item["manufacturer"]
     edit_text_key = f"editable_{session_prefix}_{position}"
     edit_maker_key = f"editablemaker_{session_prefix}_{position}"
     desc_key = f"desc_{session_prefix}_{position}"
-    if item.get("tabular_pdf") and desc_key not in st.session_state:
-        st.session_state[desc_key] = str(item["desc"])
-    left, right = st.columns([1, 1], gap="medium", vertical_alignment="top")
-    with left:
-        st.markdown("**Original text** · :gray[Read-only / selectable]")
-        active_draft = (st.session_state.get(edit_text_key, st.session_state[text_key])
-                        if item["editing"] else st.session_state[text_key])
-        comparison_text = ((st.session_state.get(desc_key, item["desc"]) + "\n")
-                           if item.get("tabular_pdf") else "") + active_draft
-        colored_reference(item["source"], comparison_text,
-                          panel_height=REVIEW_PANEL_HEIGHT + 98 if item.get("tabular_pdf") else REVIEW_PANEL_HEIGHT)
-        st.caption("Red = source line not found in the formatted text (check before approval).")
-    with right:
-        if item.get("tabular_pdf"):
-            st.text_input("Description (first line of PDF item)", key=desc_key,
-                          help="Only for table-style PDFs. Edit this value to correct the Working Sheet Description column.")
-            st.caption("The original description remains visible on the left.")
-        st.markdown("**Formatted PO Text** · :gray[" + ("Editing" if item["editing"] else "Preview") + "]")
-        if item["editing"]:
-            # Separate widget keys prevent Streamlit from resetting the stored
-            # draft when switching a read-only code block into an editor.
-            if edit_text_key not in st.session_state:
-                st.session_state[edit_text_key] = st.session_state[text_key]
-            if edit_maker_key not in st.session_state:
-                st.session_state[edit_maker_key] = st.session_state[maker_key]
-            st.text_area("Formatted Internal Note", height=REVIEW_PANEL_HEIGHT, key=edit_text_key,
+    st.session_state.setdefault(text_key, item["formatted"])
+    st.session_state.setdefault(maker_key, item["manufacturer"])
+    if item.get("tabular_pdf"):
+        st.session_state.setdefault(desc_key, str(item["desc"]))
+    draft = (st.session_state.get(edit_text_key, item["formatted"]) if item["editing"]
+             else st.session_state.get(text_key, item["formatted"]))
+    desc = st.session_state.get(desc_key, item["desc"]) if item.get("tabular_pdf") else ""
+    compared = (desc + "\n" + draft).strip() if item.get("tabular_pdf") else draft
+    issues = validate_rfq(item["source"], draft, item.get("style","default"), desc)
+    critical = sum(x["priority"] == "Critical" for x in issues)
+    a,b,c = st.columns([1,1,1])
+    a.metric("Technical warnings",len(issues))
+    b.metric("Critical warnings",critical)
+    c.metric("Remaining",len(queue)-done)
+    scroll_key = f"scrollsync_{session_prefix}"
+    st.session_state.setdefault(scroll_key, True)
+    sync = st.toggle("Synchronize preview scrolling", key=scroll_key,
+                     help="Applies to the read-only two-panel comparison. During editing, the editor scrolls independently.")
+    if item["editing"]:
+        l,r = st.columns(2, gap="medium")
+        with l:
+            st.markdown("**Original RFQ** · selectable")
+            colored_reference(item["source"], compared, panel_height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0))
+        with r:
+            if item.get("tabular_pdf"):
+                st.text_input("Description", key=desc_key)
+            st.markdown("**Formatted text** · editing")
+            st.text_area("Formatted Internal Note", key=edit_text_key, height=REVIEW_PANEL_HEIGHT,
                          label_visibility="collapsed")
             st.text_input("Manufacturer", key=edit_maker_key)
-        else:
-            formatted_reference(st.session_state[text_key])
-            st.caption("Manufacturer: " + (st.session_state[maker_key] or "(Not identified)"))
-    if not item["source"]:
-        st.info("This item has an empty source note. Verify it if the blank note is intentional.")
-    st.caption("Click Edit to correct the right-hand text or manufacturer, then click Verify. Every line requires explicit approval.")
-    back_col, skip_col, edit_col, confirm_col, all_col = st.columns([1, 1.5, 1, 2, 1.2])
-    with back_col:
-        if st.button("Previous", disabled=position == 0, key=f"back_{session_prefix}"):
-            item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
-            item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
-            if item.get("tabular_pdf"):
-                item["desc"] = st.session_state.get(desc_key, item["desc"])
-            review["position"] -= 1
+    else:
+        if item.get("tabular_pdf"):
+            st.text_input("Description (first sentence of PDF)", key=desc_key)
+        comparison_html(item["source"], compared, item.get("style","default"), sync,
+                        REVIEW_PANEL_HEIGHT + (65 if item.get("tabular_pdf") else 0))
+        st.caption("Manufacturer: " + (st.session_state[maker_key] or "Not identified"))
+    if issues:
+        with st.expander(f"Quality checks · {len(issues)} potential discrepancies", expanded=bool(critical)):
+            st.caption("These are rule-based alerts, not confirmed errors. Source exceptions and shortened certificate summaries can trigger false positives.")
+            for issue in issues[:20]:
+                mark = "🔴" if issue["priority"] == "Critical" else "🟠"
+                st.markdown(f"{mark} **{html.escape(issue['field'])}** — `{html.escape(issue['value'])}` · {issue['message']}")
+            if len(issues)>20:
+                st.caption(f"... plus {len(issues)-20} more checks")
+    else:
+        st.success("No missing labeled technical values detected by the configured rules.")
+    st.markdown("**Navigation and editing**")
+    nav_col, previous_col, next_col = st.columns([2,1,1])
+    with nav_col:
+        picked = st.selectbox("Jump to line item", options=list(range(len(queue))), index=position,
+             format_func=lambda i:f"Line {queue[i]['line']} · {'✓ Verified' if queue[i]['verified'] else 'Pending'}",
+             key=f"jump_{session_prefix}_{position}")
+        if picked != position:
+            _navigate_review(review,session_prefix,picked)
+    with previous_col:
+        if st.button("← Previous",disabled=position==0,key=f"prev_{session_prefix}",use_container_width=True):
+            _navigate_review(review,session_prefix,position-1)
+    with next_col:
+        if st.button("Next →",disabled=position==len(queue)-1,key=f"next_{session_prefix}",use_container_width=True):
+            _navigate_review(review,session_prefix,position+1)
+    left, undo_col, reset_col, verify_col, skip_col = st.columns([1,1,1,1.6,1])
+    with left:
+        if st.button("Edit" if not item["editing"] else "Editing", disabled=item["editing"], key=f"edit_{session_prefix}"):
+            st.session_state[edit_text_key]=st.session_state.get(text_key,item["formatted"])
+            st.session_state[edit_maker_key]=st.session_state.get(maker_key,item["manufacturer"])
+            item["editing"]=True
             st.rerun(scope="fragment")
-    with skip_col:
-        if st.button("Close / resume later", key=f"close_{session_prefix}"):
-            item["formatted"] = st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]
-            item["manufacturer"] = st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]
-            if item.get("tabular_pdf"):
-                item["desc"] = st.session_state.get(desc_key, item["desc"])
-            st.rerun()
-    with edit_col:
-        if st.button("Edit" if not item["editing"] else "Editing", key=f"edit_{session_prefix}",
-                     disabled=item["editing"]):
-            # Copy the visible draft into dedicated edit fields before
-            # switching widgets, so the editor never starts out empty.
-            st.session_state[edit_text_key] = st.session_state[text_key]
-            st.session_state[edit_maker_key] = st.session_state[maker_key]
-            item["editing"] = True
-            # Re-render only this dialog, not the full app, so it stays open.
-            st.rerun(scope="fragment")
-    with confirm_col:
-        if st.button("Verify & Next" if position + 1 < len(queue) else "Verify & Finish",
-                     type="primary", key=f"verify_{session_prefix}", use_container_width=True):
-            updated = (st.session_state.get(edit_text_key, st.session_state[text_key]) if item["editing"] else st.session_state[text_key]).strip()
-            desc_value = st.session_state.get(desc_key, item["desc"]).strip() if item.get("tabular_pdf") else item["desc"]
-            if item.get("tabular_pdf") and not desc_value:
-                st.error("Description cannot be empty for this PDF layout.")
+    with undo_col:
+        st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
+                  on_click=_review_undo, args=(session_prefix,))
+    with reset_col:
+        st.button("Reset draft", key=f"reset_{session_prefix}",
+                  on_click=_review_reset, args=(session_prefix,))
+    with verify_col:
+        if st.button("Verify & Next" if position+1<len(queue) else "Verify & Finish",type="primary",
+                     key=f"verify_{session_prefix}",use_container_width=True):
+            updated = (st.session_state.get(edit_text_key,draft) if item["editing"] else st.session_state[text_key]).strip()
+            new_desc = st.session_state.get(desc_key,item["desc"]).strip() if item.get("tabular_pdf") else item["desc"]
+            if item.get("tabular_pdf") and not new_desc:
+                st.error("Description cannot be empty.")
             elif item["source"] and not updated:
-                st.error("Formatted text cannot be empty when the original text has content.")
+                st.error("Formatted text cannot be empty.")
             else:
-                item["desc"] = desc_value
-                item["formatted"] = updated
-                item["manufacturer"] = (st.session_state.get(edit_maker_key, st.session_state[maker_key]) if item["editing"] else st.session_state[maker_key]).strip()
-                item["verified"] = True
-                item["editing"] = False
-                if all(row["verified"] for row in queue):
+                new_mfr = (st.session_state.get(edit_maker_key,item["manufacturer"]) if item["editing"]
+                           else st.session_state[maker_key]).strip()
+                if (updated,new_mfr,new_desc)!=(item["formatted"],item["manufacturer"],item["desc"]):
+                    item["history"].append((item["formatted"],item["manufacturer"],item["desc"]))
+                item.update(formatted=updated,manufacturer=new_mfr,desc=new_desc,verified=True,editing=False)
+                st.session_state[text_key]=updated
+                st.session_state[maker_key]=new_mfr
+                if all(q["verified"] for q in queue):
                     finalize_verified(session_prefix)
                     st.rerun()
                 else:
-                    pending = [i for i, row in enumerate(queue) if not row["verified"]]
-                    review["position"] = next((i for i in pending if i > position), pending[0])
+                    pending=[i for i,q in enumerate(queue) if not q["verified"]]
+                    review["position"]=next((i for i in pending if i>position),pending[0])
                     st.rerun(scope="fragment")
-    with all_col:
-        if st.button("Verify All", key=f"verify_all_{session_prefix}"):
-            review["confirm_all"] = True
-            # Full rerun closes review dialog before opening a separate dialog.
+    with skip_col:
+        if st.button("Verify All",key=f"verify_all_{session_prefix}"):
+            _save_current(review,session_prefix)
+            review["confirm_all"]=True
             st.rerun()
-
+    st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
+    # The iframe may access parent buttons on some Streamlit/browser versions.
+    # If the browser isolates the component, visible buttons still provide the controls.
+    components.html("""<script>(function(){try{const doc=window.parent.document;
+        if(doc.__rfqKeysInstalled)return;doc.__rfqKeysInstalled=true;
+        doc.addEventListener('keydown',function(ev){
+          if(ev.target.closest('textarea,input,[contenteditable=true]'))return;
+          let label=null;
+          if(ev.ctrlKey&&ev.key==='Enter')label='Verify &';
+          else if(ev.ctrlKey&&ev.key.toLowerCase()==='e')label='Edit';
+          else if(ev.altKey&&ev.key==='ArrowLeft')label='Previous';
+          else if(ev.altKey&&ev.key==='ArrowRight')label='Next';
+          if(!label)return;
+          const dialog=doc.querySelector('[role=dialog]');if(!dialog)return;
+          const btn=[...dialog.querySelectorAll('button')].find(b=>!b.disabled&&b.innerText.trim().includes(label));
+          if(btn){ev.preventDefault();btn.click();}
+        });}catch(_e){} })();</script>""",height=0)
 
 def review_status(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
@@ -1133,7 +1367,7 @@ def review_status(session_prefix):
         return
     queue = review["queue"]
     done = sum(1 for row in queue if row["verified"])
-    st.info(f"Prepared {len(queue)} line items locally. Verified {done}/{len(queue)}. "
+    st.info(f"Detected format: {review.get('format_label', 'Unknown')} | Prepared {len(queue)} line items locally. Verified {done}/{len(queue)}. "
             "The Working Sheet becomes available after every line is verified.")
     if st.button("Open verification window / resume", key=f"resume_{session_prefix}"):
         review_popup(session_prefix)
