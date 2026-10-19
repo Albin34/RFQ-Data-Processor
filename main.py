@@ -56,7 +56,9 @@ st.markdown("""<style>
 [data-testid="stDialog"] [data-testid="column"],
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
 [data-testid="stDialog"] iframe {min-width:0!important;max-width:100%!important;box-sizing:border-box}
-[data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0}
+[data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0;overflow:visible!important}
+[data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] {overflow:visible!important}
+[data-testid="stDialog"] [role="dialog"] {scroll-padding-bottom:110px}
 /* Match native button and selectbox heights in review navigation. */
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"],
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
@@ -1425,6 +1427,10 @@ def review_popup(session_prefix):
             review["confirm_all"]=True
             st.rerun()
     st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
+    # Leave breathing room at the bottom of the scrollable dialog so the
+    # line-item selector and verification controls are not clipped against
+    # the modal's lower edge on smaller laptop screens.
+    st.markdown("<div style='height:76px' aria-hidden='true'></div>", unsafe_allow_html=True)
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
     components.html("""<script>(function(){try{const doc=window.parent.document;
