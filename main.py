@@ -25,42 +25,39 @@ except ImportError:
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stApp {background:linear-gradient(160deg,#0d1220,#111827 52%,#0d1421)}
-/* Restore native popup scrolling. One scroll host uses the full dialog width. */
+/* Dialog: restore a single reachable vertical scroll surface.
+   Do not clip Streamlit's own dialog content or reserve a side gutter. */
 [data-testid="stDialog"] [role="dialog"] {
-  width:min(1180px, calc(100vw - 24px))!important;
+  width:min(1280px, calc(100vw - 24px))!important;
   max-width:calc(100vw - 24px)!important;
-  max-height:calc(100dvh - 20px)!important;
-  overflow:hidden!important;
+  max-height:calc(100dvh - 24px)!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
   box-sizing:border-box!important;
-  padding:0!important;
+  overscroll-behavior-y:contain;
 }
 [data-testid="stDialog"] [data-testid="stDialogContent"] {
   width:100%!important;
   min-width:0!important;
   max-width:100%!important;
-  max-height:calc(100dvh - 20px)!important;
   height:auto!important;
-  overflow-x:hidden!important;
-  overflow-y:auto!important;
-  overscroll-behavior-y:contain;
-  scrollbar-gutter:auto!important;
+  max-height:none!important;
+  overflow:visible!important;
   box-sizing:border-box!important;
   padding:1rem 1.1rem!important;
 }
 [data-testid="stDialog"] [data-testid="stDialogContent"] > div {
   min-width:0!important;
+  width:100%!important;
   max-width:100%!important;
-  overflow:visible!important;
   box-sizing:border-box!important;
 }
-/* Keep the genuine outer scrollbar available; do not reserve a blank rail. */
-[data-testid="stDialog"] [data-testid="stDialogContent"] {scrollbar-width:thin}
 [data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.55rem;min-width:0}
 [data-testid="stDialog"] [data-testid="column"],
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
 [data-testid="stDialog"] iframe {min-width:0!important;max-width:100%!important;box-sizing:border-box}
 [data-testid="stDialog"] [data-testid="stSelectbox"] {min-width:0}
-/* Match native button and selectbox heights in the review navigation. */
+/* Match native button and selectbox heights in review navigation. */
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"],
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
 [data-testid="stDialog"] .stButton button {min-height:42px!important}
