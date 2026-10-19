@@ -25,26 +25,30 @@ except ImportError:
 st.set_page_config(page_title="RFQ Data Processor", layout="wide", initial_sidebar_state="auto")
 st.markdown("""<style>
 .stApp {background:linear-gradient(160deg,#0d1220,#111827 52%,#0d1421)}
-/* Size the actual modal rather than stretching its children beyond the viewport. */
-[data-testid="stDialog"] [role="dialog"],
-[data-testid="stDialog"] [data-testid="stDialogContent"] {
-  width:min(1200px,94vw)!important;max-width:94vw!important;
+/* One fixed-width dialog: no nested page scrolling or unused right gutter. */
+[data-testid="stDialog"] [role="dialog"] {
+  width:min(1180px, calc(100vw - 24px))!important;
+  max-width:calc(100vw - 24px)!important;
+  max-height:calc(100dvh - 20px)!important;
+  overflow:hidden!important;
   box-sizing:border-box!important;
 }
-/* Hide only the redundant OUTER modal scrollbar; keep modal wheel/touch
-   scrolling operational and retain both inner RFQ text-panel scrollbars. */
-[data-testid="stDialog"] [role="dialog"],
 [data-testid="stDialog"] [data-testid="stDialogContent"] {
-  overflow-x:hidden!important;
-  scrollbar-width:none!important;
-  -ms-overflow-style:none!important;
+  width:100%!important;
+  max-width:100%!important;
+  height:100%!important;
+  overflow:hidden!important;
+  box-sizing:border-box!important;
+  padding-right:1rem!important;
+}
+/* Depending on Streamlit version, the internal block is the scroll host. */
+[data-testid="stDialog"] [data-testid="stDialogContent"] > div {
+  max-width:100%!important;
+  overflow:visible!important;
+  box-sizing:border-box!important;
 }
 [data-testid="stDialog"] [role="dialog"]::-webkit-scrollbar,
-[data-testid="stDialog"] [data-testid="stDialogContent"]::-webkit-scrollbar {
-  width:0!important;
-  height:0!important;
-  display:none!important;
-}
+[data-testid="stDialog"] [data-testid="stDialogContent"]::-webkit-scrollbar {display:none!important}
 [data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap:.55rem;min-width:0}
 [data-testid="stDialog"] [data-testid="column"],
 [data-testid="stDialog"] [data-testid="stHorizontalBlock"],
@@ -54,9 +58,9 @@ st.markdown("""<style>
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"],
 [data-testid="stDialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
 [data-testid="stDialog"] .stButton button {min-height:42px!important}
-.rfq-review-stat{background:#192436;border:1px solid #344158;border-radius:10px;padding:12px 14px;min-height:94px;box-sizing:border-box}
+.rfq-review-stat{background:#192436;border:1px solid #344158;border-radius:10px;padding:12px 14px;min-height:72px;box-sizing:border-box}
 .rfq-stat-label{color:#dae2f0;font-size:14px;font-weight:600}
-.rfq-stat-count{color:#f5f8fd;font-size:29px;font-weight:600;line-height:1.4;margin-top:3px}
+.rfq-stat-count{color:#f5f8fd;font-size:25px;font-weight:600;line-height:1.15;margin-top:3px}
 .rfq-orange{color:#ffa742!important}.rfq-red{color:#ff6868!important}
 .rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0}
 [data-testid="stDialog"] .stButton button {white-space:nowrap;padding-left:.5rem;padding-right:.5rem}
@@ -1145,7 +1149,7 @@ def _comparison_line(line):
     return re.sub(r"\s+", "", line).casefold()
 
 
-REVIEW_PANEL_HEIGHT = 400
+REVIEW_PANEL_HEIGHT = 250
 
 
 def _review_panel(body, *, empty_label="(No text)", panel_height=None):
@@ -1418,29 +1422,6 @@ def review_popup(session_prefix):
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
     components.html("""<script>(function(){try{const doc=window.parent.document;
-        if(!doc.__rfqWheelInstalled){doc.__rfqWheelInstalled=true;
-          doc.addEventListener('wheel',function(ev){
-            const modal=doc.querySelector('[data-testid="stDialog"] [role="dialog"]') || doc.querySelector('[role="dialog"]');
-            if(!modal || !modal.contains(ev.target) || ev.ctrlKey)return;
-            // Let scrollable editors, select menus, and preview iframes handle their own wheel events.
-            if(ev.target.closest('textarea,[role="listbox"],[data-baseweb="popover"],iframe'))return;
-            let target=ev.target, innerScrollable=false;
-            while(target && target!==modal){
-              if(target instanceof Element){
-                const cs=window.getComputedStyle(target);
-                if(/auto|scroll/.test(cs.overflowY) && target.scrollHeight>target.clientHeight+2){innerScrollable=true;break;}
-              }
-              target=target.parentElement;
-            }
-            if(innerScrollable)return;
-            const options=[modal,...modal.querySelectorAll('[data-testid="stDialogContent"],section')];
-            const scroller=options.find(x=>x.scrollHeight>x.clientHeight+4);
-            if(!scroller)return;
-            const before=scroller.scrollTop;
-            scroller.scrollTop+=ev.deltaY;
-            if(scroller.scrollTop!==before)ev.preventDefault();
-          },{passive:false});
-        }
         if(doc.__rfqKeysInstalled)return;doc.__rfqKeysInstalled=true;
         doc.addEventListener('keydown',function(ev){
           if(ev.target.closest('textarea,input,[contenteditable=true]'))return;
