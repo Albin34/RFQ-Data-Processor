@@ -1077,23 +1077,65 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     return stats
 
 
+def _review_enter_edit(prefix):
+    """Initialize each editor from the last nonempty approved/saved draft."""
+    review = st.session_state[f"{prefix}_review"]
+    pos = review["position"]
+    item = review["queue"][pos]
+    current = st.session_state.get(f"formatted_{prefix}_{pos}") or item["formatted"]
+    if not str(current).strip():
+        current = item.get("initial_formatted", "")
+    st.session_state[f"editable_{prefix}_{pos}"] = current
+    st.session_state[f"editablemaker_{prefix}_{pos}"] = st.session_state.get(
+        f"maker_{prefix}_{pos}", item["manufacturer"])
+    item["editing"] = True
+
+
+def bold_preview_html(text):
+    """Render actual bold emphasis next to editable plain text (no Markdown in export)."""
+    lines = []
+    for line in str(text).splitlines():
+        chunks = []
+        start = 0
+        for match in BOLD_MARKERS.finditer(line):
+            chunks.append(html.escape(line[start:match.start()]))
+            chunks.append('<strong>' + html.escape(match.group(1)) + '</strong>')
+            start = match.end()
+        chunks.append(html.escape(line[start:]))
+        rendered = ''.join(chunks)
+        if BOLD_TECHNICAL_LINE.match(plain_review_text(line)):
+            rendered = '<strong>' + rendered + '</strong>'
+        lines.append(rendered)
+    return '<div style="max-height:150px;overflow:auto;background:#171e2c;border:1px solid #3b465a;border-radius:8px;padding:10px;color:#e1e7f0;font:12px Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6">' + '\n'.join(lines) + '</div>'
+
+
 def _save_current(review, prefix):
-    pos=review["position"]
-    item=review["queue"][pos]
+    """Save edits without ever replacing a nonempty item by an empty widget state."""
+    pos = review["position"]
+    item = review["queue"][pos]
     if item.get("editing"):
-        item["formatted"] = st.session_state.get(f"editable_{prefix}_{pos}", item["formatted"])
+        value = st.session_state.get(f"editable_{prefix}_{pos}")
+        if value is None or (not str(value).strip() and str(item["source"]).strip()):
+            st.error("The formatted editor is empty. Restore or enter text before leaving this item.")
+            return False
+        item["formatted"] = value
         item["manufacturer"] = st.session_state.get(f"editablemaker_{prefix}_{pos}", item["manufacturer"])
     else:
-        item["formatted"] = st.session_state.get(f"formatted_{prefix}_{pos}", item["formatted"])
+        value = st.session_state.get(f"formatted_{prefix}_{pos}", item["formatted"])
+        if value is None or (not str(value).strip() and str(item["source"]).strip()):
+            st.error("Formatted text is empty; cannot navigate without restoring it.")
+            return False
+        item["formatted"] = value
         item["manufacturer"] = st.session_state.get(f"maker_{prefix}_{pos}", item["manufacturer"])
     if item.get("tabular_pdf"):
         item["desc"] = st.session_state.get(f"desc_{prefix}_{pos}", item["desc"])
     st.session_state[f"formatted_{prefix}_{pos}"] = item["formatted"]
     st.session_state[f"maker_{prefix}_{pos}"] = item["manufacturer"]
-
+    return True
 
 def _navigate_review(review, prefix, new_position):
-    _save_current(review, prefix)
+    if not _save_current(review, prefix):
+        return
     review["position"] = new_position
     st.rerun(scope="fragment")
 
@@ -1446,9 +1488,7 @@ def review_popup(session_prefix):
             if st.button("Edit" if not item["editing"] else "Editing",
                          disabled=item["editing"], key=f"edit_{session_prefix}",
                          help=action_help["edit"], use_container_width=True):
-                st.session_state[edit_text_key] = st.session_state.get(text_key, item["formatted"])
-                st.session_state[edit_maker_key] = st.session_state.get(maker_key, item["manufacturer"])
-                item["editing"] = True
+                _review_enter_edit(session_prefix)
                 st.rerun(scope="fragment")
         with tool_undo:
             st.button("Undo", key=f"undo_{session_prefix}", disabled=not item["history"],
@@ -1459,6 +1499,12 @@ def review_popup(session_prefix):
                       on_click=_review_reset, args=(session_prefix,),
                       help=action_help["reset"], use_container_width=True)
     if item["editing"]:
+        # Ensure the widget has the complete saved draft before Streamlit creates it.
+        if edit_text_key not in st.session_state or (
+            not str(st.session_state[edit_text_key]).strip() and str(item["formatted"]).strip()
+        ):
+            st.session_state[edit_text_key] = item["formatted"]
+        st.session_state.setdefault(edit_maker_key, item["manufacturer"])
         left_panel, right_panel = st.columns([1, 1], gap="medium")
         with left_panel:
             st.markdown("**Original RFQ** · selectable")
@@ -1473,7 +1519,9 @@ def review_popup(session_prefix):
                          height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0),
                          label_visibility="collapsed",
                          help="Select any text and press Ctrl+B to toggle bold in the Working Sheet. **markers** are converted into Excel formatting.")
-            st.caption("Ctrl+B: select text to toggle bold for the Working Sheet. Manufacturer and part-number lines are bold automatically.")
+            st.caption("Ctrl+B: select text to toggle bold. Bold is shown in the preview below and exported to the Working Sheet.")
+            st.markdown("**Bold formatting preview**")
+            st.markdown(bold_preview_html(st.session_state.get(edit_text_key, item["formatted"])), unsafe_allow_html=True)
             st.text_input("Manufacturer", key=edit_maker_key)
     else:
         if item.get("tabular_pdf"):
@@ -1546,9 +1594,9 @@ def review_popup(session_prefix):
                     st.rerun(scope="fragment")
     with skip_col:
         if st.button("Verify All",key=f"verify_all_{session_prefix}", use_container_width=True, help=action_help["verify_all"]):
-            _save_current(review,session_prefix)
-            review["confirm_all"]=True
-            st.rerun()
+            if _save_current(review,session_prefix):
+                review["confirm_all"]=True
+                st.rerun()
     st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
