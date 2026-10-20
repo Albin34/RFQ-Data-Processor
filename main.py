@@ -1464,7 +1464,6 @@ def finalize_verified(session_prefix):
         for col, value in {
             "A": item["line"], "B": item["desc"], "C": item["qty"],
             "D": item["uom"], "E": plain_review_text(item["formatted"]),
-            "G": item["manufacturer"],
         }.items():
             sheet[f"{col}{i}"] = value
         sheet[f"A{i}"].fill = copy(line_fill)
@@ -1475,8 +1474,11 @@ def finalize_verified(session_prefix):
     for row_number in range(2, blue_fill_end_row + 1):
         sheet[f"A{row_number}"].fill = copy(line_fill)
     sheet["E1"] = "Internal Note"
-    sheet.delete_cols(8, 1)  # mail id
-    sheet.delete_cols(6, 1)  # Subject line; Manufacturer moves to F
+    # The Working Sheet contains only A:E. Remove any legacy Manufacturer,
+    # Subject line, mail ID or unused template columns rather than exporting
+    # a sixth field.
+    if sheet.max_column > 5:
+        sheet.delete_cols(6, sheet.max_column - 5)
     for other in list(wb.worksheets):
         if other is not sheet:
             wb.remove(other)
@@ -1707,13 +1709,11 @@ def review_popup(session_prefix):
                          label_visibility="collapsed",
                          help="Select any text and press Ctrl+B to toggle bold in the Working Sheet. **markers** are converted into Excel formatting.")
             st.caption("Ctrl+B toggles ** markers around the selected text. Markers become bold in the Working Sheet and are not exported literally.")
-            st.text_input("Manufacturer", key=edit_maker_key)
     else:
         if item.get("tabular_pdf"):
             st.text_input("Description (first sentence of PDF)", key=desc_key)
         comparison_html(item["source"], compared, item.get("style", "default"), sync,
                         REVIEW_PANEL_HEIGHT + (65 if item.get("tabular_pdf") else 0))
-        st.caption("Manufacturer: " + (st.session_state[maker_key] or "Not identified"))
     if issues:
         with st.expander(f"Quality checks · {len(issues)} potential discrepancies", expanded=bool(critical)):
             st.caption("These are rule-based alerts, not confirmed errors. Source exceptions and shortened certificate summaries can trigger false positives.")
