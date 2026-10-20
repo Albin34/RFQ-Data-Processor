@@ -770,13 +770,28 @@ def remove_separator_lines(value):
 
 
 def normalize_technical_punctuation(text):
-    """Light-touch formatting of punctuation without changing measurements/codes."""
-    # Preserve digits, punctuation within model numbers and decimal separators.
-    # Add a space after a field colon, except inside numeric ratios/times.
-    text = re.sub(r"(?<=[A-Za-z]):(?=[A-Za-z0-9])", ": ", text)
-    # A comma followed immediately by prose gets a space; never change 1,000.
-    text = re.sub(r"(?<=[A-Za-z0-9]),(?=[A-Za-z])", ", ", text)
+    """Make label punctuation legible without changing decimal or identifier codes."""
+    # Fix FIELD:VALUE even if the value begins with +/- or a decimal sign.
+    text = re.sub(r"(?<=[A-Za-z])\s*:(?=[^\s/:])", ": ", text)
+    # After word-ending commas insert a space unless the next token is numeric
+    # punctuation or a code delimiter. Preserve quantities like 1,000.
+    text = re.sub(r"(?<=[A-Za-z]),(?=[A-Za-z])", ", ", text)
+    text = re.sub(r"(?<=[0-9]),(?=[A-Za-z])", ", ", text)
     return text
+
+
+def split_nested_equipment_fields(text):
+    """Start nested specification fields on new lines after wrapped joins."""
+    labels = ("SET PRESSURE", "BACK PRESSURE", "BLOWDOWN", "VALVE ORIFICE",
+              "RELVG. CAPACITY", "CAPACITY", "BODY MATERIAL", "TRIM MATERIAL")
+    result = []
+    for line in text.splitlines():
+        if re.match(r"^EQUIPMENT SPECS(?:\d+)?\s*:", line, re.I):
+            for label in labels:
+                pattern = r",\s*(" + re.escape(label) + r"\s*:)"
+                line = re.sub(pattern, lambda m: "\n" + m.group(1), line, flags=re.I)
+        result.append(line)
+    return "\n".join(result)
 
 
 def join_pdf_wrapped_lines(note):
@@ -829,7 +844,7 @@ def format_tabular_pdf_note(note):
     if not physical:
         return "", ""
 
-    formatted = join_pdf_wrapped_lines(note)
+    formatted = split_nested_equipment_fields(join_pdf_wrapped_lines(note))
     # A tabular item's first sentence is exported as Description, not as part
     # of the formatted PO Text. Strip it even if it leaked into the note.
     # (The caller passes a separate description when preparing review.)
@@ -1258,7 +1273,7 @@ def working_sheet_rich_text(text):
         for match in BOLD_MARKERS.finditer(line):
             if match.start() > cursor:
                 segments.append((line[cursor:match.start()], auto_bold))
-            segments.append((match.group(1), not auto_bold))
+            segments.append((match.group(1), True))
             cursor = match.end()
         if cursor < len(line):
             segments.append((line[cursor:], auto_bold))
@@ -1274,6 +1289,72 @@ def working_sheet_rich_text(text):
         else:
             result.append(value)
     return result
+
+
+def make_rich_text_shared_strings(data):
+    """Store mixed-format inline text in sharedStrings.xml for Excel compatibility.
+
+    openpyxl writes rich-text cells as inlineStr. Excel's repair dialog can report
+    'String properties from sheet1.xml' on these records. Move only rich inline
+    strings into the standard shared-string table while preserving text runs.
+    """
+    import zipfile
+    from xml.etree import ElementTree as etree
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    relns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    typens = "http://schemas.openxmlformats.org/package/2006/content-types"
+    q = lambda name: "{%s}%s" % (ns, name)
+    with zipfile.ZipFile(BytesIO(data)) as zin:
+        files = {name:zin.read(name) for name in zin.namelist()}
+    sheet_name = "xl/worksheets/sheet1.xml"
+    if sheet_name not in files:
+        return data
+    root = etree.fromstring(files[sheet_name])
+    rich_cells = []
+    for cell in root.iter(q("c")):
+        inline = cell.find(q("is"))
+        if inline is not None and inline.find(q("r")) is not None:
+            rich_cells.append((cell, inline))
+    if not rich_cells:
+        return data
+    table_name = "xl/sharedStrings.xml"
+    if table_name in files:
+        sst = etree.fromstring(files[table_name])
+        offset = len(sst.findall(q("si")))
+    else:
+        sst = etree.Element(q("sst"), nsmap={None:ns})
+        offset = 0
+    for index, (cell, inline) in enumerate(rich_cells):
+        si = etree.SubElement(sst, q("si"))
+        for run in list(inline):
+            si.append(run)
+        cell.remove(inline)
+        cell.set("t", "s")
+        etree.SubElement(cell, q("v")).text = str(offset + index)
+    sst.set("count", str(offset + len(rich_cells)))
+    sst.set("uniqueCount", str(offset + len(rich_cells)))
+    files[sheet_name] = etree.tostring(root, encoding="utf-8")
+    files[table_name] = etree.tostring(sst, encoding="utf-8", xml_declaration=True)
+    ctroot = etree.fromstring(files["[Content_Types].xml"])
+    if not any(el.get("PartName") == "/xl/sharedStrings.xml" for el in ctroot):
+        etree.SubElement(ctroot, "{%s}Override" % typens,
+                         PartName="/xl/sharedStrings.xml",
+                         ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml")
+    files["[Content_Types].xml"] = etree.tostring(ctroot, encoding="utf-8")
+    relfile = "xl/_rels/workbook.xml.rels"
+    rr = etree.fromstring(files[relfile])
+    target_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
+    if not any(el.get("Type") == target_type for el in rr):
+        existing = [int(el.get("Id")[3:]) for el in rr if (el.get("Id") or "").startswith("rId") and (el.get("Id") or "")[3:].isdigit()]
+        etree.SubElement(rr, "{%s}Relationship" % relns,
+                         Id="rId%d" % (max(existing, default=0)+1),
+                         Type=target_type, Target="sharedStrings.xml")
+    files[relfile] = etree.tostring(rr, encoding="utf-8")
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, raw in files.items():
+            zout.writestr(name, raw)
+    return output.getvalue()
 
 
 def finalize_verified(session_prefix):
@@ -1312,7 +1393,7 @@ def finalize_verified(session_prefix):
         if other is not sheet:
             wb.remove(other)
     wrap_all(sheet)
-    output_bytes = workbook_bytes(wb)
+    output_bytes = make_rich_text_shared_strings(workbook_bytes(wb))
     # Reopen the exact generated file to catch malformed OOXML before delivery.
     try:
         reopened = load_workbook(BytesIO(output_bytes), read_only=False, rich_text=True)
@@ -1380,13 +1461,13 @@ def formatted_reference(formatted):
     _review_panel(html.escape(formatted), empty_label="(Empty formatted text)")
 
 
-@st.dialog("Confirm Verify All", width="small")
+@st.dialog("Confirm Verify All", width="large")
 def confirm_verify_all_popup(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
     if not review or review.get("completed"):
         return
     st.markdown("""<style>
-    div[data-testid="stDialog"] [role="dialog"] {box-sizing:border-box;max-width:min(94vw,580px)!important;min-width:0!important}
+    div[data-testid="stDialog"] [role="dialog"] {box-sizing:border-box;max-width:min(92vw,720px)!important;min-width:0!important}
     div[data-testid="stDialog"] [role="dialog"] [data-testid="stVerticalBlock"] {min-width:0}
     div[data-testid="stDialog"] [role="dialog"] [data-testid="stAlert"] {max-width:100%;overflow-wrap:anywhere;box-sizing:border-box}
     </style>""",unsafe_allow_html=True)
@@ -1569,6 +1650,8 @@ def review_popup(session_prefix):
         severity = (" (🔴 Critical Warning)" if any(w["priority"] == "Critical" for w in warnings)
                     else " (🟠 Technical Warning)" if warnings else "")
         status = "" if q["verified"] else " · Pending"
+        if q["verified"]:
+            severity = ""
         return f"Line {q['line']}{status}{severity}"
     with nav_col:
         st.markdown("<div class='rfq-nav-label'>Jump to line item</div>", unsafe_allow_html=True)
