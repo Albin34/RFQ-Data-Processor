@@ -98,15 +98,26 @@ st.markdown("""<style>
 
 /* Only the Verify All dialog should be compact; not the main review dialog. */
 [data-testid="stDialog"] [role="dialog"]:has(#rfq-confirm-modal) {
-  width:min(540px, calc(100vw - 32px))!important;
-  max-width:min(540px, calc(100vw - 32px))!important;
+  width:min(490px, calc(100vw - 32px))!important;
+  max-width:min(490px, calc(100vw - 32px))!important;
   min-width:0!important;
   height:auto!important;
   max-height:calc(100dvh - 32px)!important;
 }
 [data-testid="stDialog"] [role="dialog"]:has(#rfq-confirm-modal) [data-testid="stAlert"] {
+  width:100%!important;
   max-width:100%!important;
   box-sizing:border-box!important;
+  padding-right:.5rem!important;
+}
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-confirm-modal) [data-testid="stHorizontalBlock"] {
+  justify-content:center!important;
+  gap:12px!important;
+}
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-confirm-modal) [data-testid="column"] {
+  flex:0 1 150px!important;
+  width:150px!important;
+  min-width:0!important;
 }
 </style>""", unsafe_allow_html=True)
 
@@ -784,8 +795,22 @@ def remove_separator_lines(value):
 
 def normalize_technical_punctuation(text):
     """Make label punctuation legible without changing decimal or identifier codes."""
-    # Fix FIELD:VALUE even if the value begins with +/- or a decimal sign.
-    text = re.sub(r"(?<=[A-Za-z])\s*:(?=[^\s/:])", ": ", text)
+    # Normalize both FIELD : VALUE and FIELD:VALUE. Do not modify URI schemes,
+    # clock times (12:30), numeric ratios (1:2), or Windows drive paths (C:\\).
+    # Apply to each line, where a labelled technical field is expected.
+    def normalize_line(line):
+        match = re.match(r"^(\s*)([A-Za-z][A-Za-z0-9 /().#_+\-]{0,75}?)(\s*):(?![/\\])(\s*)(.*)$", line)
+        if match:
+            leading, label, _, _, value = match.groups()
+            label = label.rstrip()
+            if label.lower() not in ("http", "https", "ftp"):
+                return f"{leading}{label}: {value}" if value else f"{leading}{label}:"
+        return line
+    text = "\n".join(normalize_line(line) for line in text.split("\n"))
+    # Also normalize nested colon-separated technical labels such as
+    # 'SET PRESSURE :6.0' while leaving number-number delimiters untouched.
+    text = re.sub(r"(?<=[A-Za-z])\s+:\s*(?=[^\s/:])", ": ", text)
+    text = re.sub(r"(?<=[A-Za-z]):(?=[^\s/:])", ": ", text)
     # After word-ending commas insert a space unless the next token is numeric
     # punctuation or a code delimiter. Preserve quantities like 1,000.
     text = re.sub(r"(?<=[A-Za-z]),(?=[A-Za-z])", ", ", text)
@@ -1221,6 +1246,9 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
                                    if format_style == "tabular_pdf"
                                    else summarize_nawah_working_note(note) if format_style in ("nawah_pdf", "nawah_excel")
                                    else process_rfq_text(note))
+        # Formatting-only normalization across all RFQ formats. The original
+        # source and Uploading Sheet PO Text are deliberately not altered.
+        formatted = normalize_technical_punctuation(formatted)
         formatted = space_after_initial_section_header(formatted)
         is_table = format_style == "tabular_pdf"
         if is_table:
@@ -1529,7 +1557,7 @@ def confirm_verify_all_popup(session_prefix):
     st.markdown('<div id="rfq-confirm-modal"></div>', unsafe_allow_html=True)
     st.warning("Confirm to skip the verification process at your own risk")
     st.caption("This will approve every remaining line without individual review.")
-    yes_col, no_col = st.columns(2)
+    yes_col, no_col = st.columns([1, 1], gap="small")
     with yes_col:
         if st.button("Confirm", type="primary", key=f"confirm_all_{session_prefix}", use_container_width=True):
             queue = review["queue"]
