@@ -72,16 +72,18 @@ st.markdown("""<style>
 .rfq-nav-label{height:23px;font-size:14px;font-weight:600;line-height:21px;margin:0;position:relative;top:-6px}
 /* Make Streamlit's editable field visually match the read-only comparison. */
 [data-testid="stDialog"] [data-testid="stTextArea"] textarea {
-  background:#171e2c!important;
-  color:#e1e7f0!important;
-  border:1px solid #3b465a!important;
+  background:#ffffff!important;
+  color:#172033!important;
+  border:1px solid #aebccd!important;
   border-radius:12px!important;
   font-family:ui-monospace,Consolas,monospace!important;
   font-size:12.5px!important;
   line-height:1.65!important;
   padding:14px!important;
-  overflow-wrap:anywhere!important;
-  white-space:pre-wrap!important;
+  overflow-wrap:normal!important;
+  word-break:normal!important;
+  white-space:pre!important;
+  overflow-x:auto!important;
   resize:none!important;
 }
 [data-testid="stDialog"] [data-testid="stTextArea"] textarea:focus {
@@ -1048,16 +1050,16 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
         right_lines.append(display)
     right = "\n".join(right_lines)
     document = """<!doctype html><html><head><meta charset="utf-8"><style>
-    html,body{margin:0;background:transparent;color:#eef2fa;font:13px ui-monospace,Consolas,monospace}
+    html,body{margin:0;background:transparent;color:#172033;font:13px ui-monospace,Consolas,monospace}
     *{box-sizing:border-box}
     .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;padding:2px;width:100%;max-width:100%;overflow:hidden}
     .grid>div{min-width:0;max-width:100%;overflow:hidden}
-    .heading{font:600 13px system-ui;margin:0 0 9px;color:#dde8f8}
-    .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#171e2c;
-      border:1px solid #3b465a;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
+    .heading{font:600 13px system-ui;margin:0 0 9px;color:#dae2f0}
+    .panel{height:HEIGHTpx;overflow:auto;scrollbar-gutter:stable;background:#ffffff;
+      border:1px solid #aebccd;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;line-height:1.65;font:12.5px ui-monospace,Consolas,monospace}
-    .missing{color:#ff8a8a;font-weight:600}.excluded{color:#69c9ff}
-    .matched{color:#b5ffb9}.normal{color:#e1e7f0}
+    .missing{color:#bd1e32;font-weight:600}.excluded{color:#0868a8}
+    .matched{color:#14532d}.normal{color:#172033}
     .legend{font:12px system-ui;color:#a6b6cb;margin:8px 0 0}
     @media(max-width:620px){.grid{grid-template-columns:1fr}.panel{height:240px}}
     </style></head><body><div class="grid">
@@ -1077,6 +1079,21 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     return stats
 
 
+def editor_bold_markers(text):
+    """Expose automatically bold technical lines using editable **...** markers.
+
+    Marker delimiters are inserted inside each line, never across a newline.
+    Already marked lines remain untouched to preserve manually toggled styling.
+    """
+    output = []
+    for line in str(text).split("\n"):
+        if BOLD_TECHNICAL_LINE.match(plain_review_text(line)) and "**" not in line:
+            output.append("**" + line + "**")
+        else:
+            output.append(line)
+    return "\n".join(output)
+
+
 def _review_enter_edit(prefix):
     """Initialize each editor from the last nonempty approved/saved draft."""
     review = st.session_state[f"{prefix}_review"]
@@ -1085,28 +1102,10 @@ def _review_enter_edit(prefix):
     current = st.session_state.get(f"formatted_{prefix}_{pos}") or item["formatted"]
     if not str(current).strip():
         current = item.get("initial_formatted", "")
-    st.session_state[f"editable_{prefix}_{pos}"] = current
+    st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(current)
     st.session_state[f"editablemaker_{prefix}_{pos}"] = st.session_state.get(
         f"maker_{prefix}_{pos}", item["manufacturer"])
     item["editing"] = True
-
-
-def bold_preview_html(text):
-    """Render actual bold emphasis next to editable plain text (no Markdown in export)."""
-    lines = []
-    for line in str(text).splitlines():
-        chunks = []
-        start = 0
-        for match in BOLD_MARKERS.finditer(line):
-            chunks.append(html.escape(line[start:match.start()]))
-            chunks.append('<strong>' + html.escape(match.group(1)) + '</strong>')
-            start = match.end()
-        chunks.append(html.escape(line[start:]))
-        rendered = ''.join(chunks)
-        if BOLD_TECHNICAL_LINE.match(plain_review_text(line)):
-            rendered = '<strong>' + rendered + '</strong>'
-        lines.append(rendered)
-    return '<div style="max-height:150px;overflow:auto;background:#171e2c;border:1px solid #3b465a;border-radius:8px;padding:10px;color:#e1e7f0;font:12px Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6">' + '\n'.join(lines) + '</div>'
 
 
 def _save_current(review, prefix):
@@ -1318,8 +1317,8 @@ def _review_panel(body, *, empty_label="(No text)", panel_height=None):
     actual_height = panel_height or REVIEW_PANEL_HEIGHT
     st.html(
         '<div style="box-sizing:border-box;height:' + str(actual_height) + 'px;'
-        'overflow-y:auto;overflow-x:hidden;background:#1a1d26;color:#f4f4f5;'
-        'border:1px solid #363b48;border-radius:10px;padding:16px;'
+        'overflow-y:auto;overflow-x:hidden;background:#ffffff;color:#172033;'
+        'border:1px solid #aebccd;border-radius:10px;padding:16px;'
         'user-select:text;scrollbar-gutter:stable">'
         '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;'
         'font-family:ui-monospace,SFMono-Regular,Consolas,monospace;'
@@ -1340,11 +1339,11 @@ def colored_reference(original, formatted, panel_height=None, format_style="defa
         if in_quality and format_style.startswith("nawah") and cls == "missing":
             cls = "excluded"
         style = {
-            "missing": "color:#ff8a8a;font-weight:600",
-            "excluded": "color:#69c9ff",
-            "matched": "color:#b5ffb9",
-            "normal": "color:#e1e7f0",
-        }.get(cls, "color:#e1e7f0")
+            "missing": "color:#bd1e32;font-weight:600",
+            "excluded": "color:#0868a8",
+            "matched": "color:#14532d",
+            "normal": "color:#172033",
+        }.get(cls, "color:#172033")
         highlighted_lines.append(
             f'<span style="{style}">{html.escape(line)}</span>')
     content = "\n".join(highlighted_lines)
@@ -1405,7 +1404,7 @@ def _review_undo(prefix):
     item.update(formatted=text, manufacturer=maker, desc=desc, verified=False)
     st.session_state[f"formatted_{prefix}_{pos}"] = text
     st.session_state[f"maker_{prefix}_{pos}"] = maker
-    st.session_state[f"editable_{prefix}_{pos}"] = text
+    st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(text)
     st.session_state[f"editablemaker_{prefix}_{pos}"] = maker
     if item.get("tabular_pdf"):
         st.session_state[f"desc_{prefix}_{pos}"] = desc
@@ -1421,7 +1420,7 @@ def _review_reset(prefix):
                 desc=item["initial_desc"],verified=False)
     st.session_state[f"formatted_{prefix}_{pos}"] = item["formatted"]
     st.session_state[f"maker_{prefix}_{pos}"] = item["manufacturer"]
-    st.session_state[f"editable_{prefix}_{pos}"] = item["formatted"]
+    st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(item["formatted"])
     st.session_state[f"editablemaker_{prefix}_{pos}"] = item["manufacturer"]
     if item.get("tabular_pdf"):
         st.session_state[f"desc_{prefix}_{pos}"] = item["desc"]
@@ -1503,7 +1502,7 @@ def review_popup(session_prefix):
         if edit_text_key not in st.session_state or (
             not str(st.session_state[edit_text_key]).strip() and str(item["formatted"]).strip()
         ):
-            st.session_state[edit_text_key] = item["formatted"]
+            st.session_state[edit_text_key] = editor_bold_markers(item["formatted"])
         st.session_state.setdefault(edit_maker_key, item["manufacturer"])
         left_panel, right_panel = st.columns([1, 1], gap="medium")
         with left_panel:
@@ -1519,9 +1518,7 @@ def review_popup(session_prefix):
                          height=REVIEW_PANEL_HEIGHT + (90 if item.get("tabular_pdf") else 0),
                          label_visibility="collapsed",
                          help="Select any text and press Ctrl+B to toggle bold in the Working Sheet. **markers** are converted into Excel formatting.")
-            st.caption("Ctrl+B: select text to toggle bold. Bold is shown in the preview below and exported to the Working Sheet.")
-            st.markdown("**Bold formatting preview**")
-            st.markdown(bold_preview_html(st.session_state.get(edit_text_key, item["formatted"])), unsafe_allow_html=True)
+            st.caption("Ctrl+B toggles ** markers around the selected text. Markers become bold in the Working Sheet and are not exported literally.")
             st.text_input("Manufacturer", key=edit_maker_key)
     else:
         if item.get("tabular_pdf"):
