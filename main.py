@@ -1149,8 +1149,15 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
        to.scrollTop=(from.scrollTop/max)*target;to.scrollLeft=from.scrollLeft;lock=false;}
     a.addEventListener('scroll',()=>follow(a,b));b.addEventListener('scroll',()=>follow(b,a));
     </script></body></html>"""
-    document = document.replace('HEIGHT', str(height)).replace('RIGHT',right).replace('LEFT',left)
-    document = document.replace('SYNC', 'true' if sync else 'false').replace('MODE', 'Synchronized scroll' if sync else 'Independent scroll')
+    # Replace template placeholders before inserting RFQ text. Global replacement
+    # afterwards corrupts source words such as MODEL (MODE -> scroll label).
+    document = document.replace('height:HEIGHTpx', f'height:{height}px')
+    document = document.replace('const synced=SYNC;',
+                                'const synced=' + ('true' if sync else 'false') + ';')
+    document = document.replace('· MODE</div>',
+                                '· ' + ('Synchronized scroll' if sync else 'Independent scroll') + '</div>')
+    document = document.replace('<pre>LEFT</pre>', '<pre>' + left + '</pre>')
+    document = document.replace('<pre>RIGHT</pre>', '<pre>' + right + '</pre>')
     components.html(document, height=height + 62, scrolling=False, width=None)
     return stats
 
