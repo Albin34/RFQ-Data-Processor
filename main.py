@@ -1806,55 +1806,69 @@ def review_popup(session_prefix):
                 review["confirm_all"]=True
                 st.rerun()
     st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
-    # The iframe may access parent buttons on some Streamlit/browser versions.
-    # If the browser isolates the component, visible buttons still provide the controls.
-    components.html("""<script>(function(){
-      try {
-        const doc=window.parent.document;
-        if(doc.__rfqKeyHandler) doc.removeEventListener('keydown',doc.__rfqKeyHandler,true);
-        function handler(ev){
-          const dialog=doc.querySelector('[role=dialog]');
-          if(!dialog || !dialog.contains(ev.target))return;
-          const t=ev.target;
-          const editing=t.tagName==='TEXTAREA' || t.tagName==='INPUT' || t.isContentEditable;
-          if((ev.ctrlKey||ev.metaKey) && !ev.altKey && ev.key.toLowerCase()==='b' && t.tagName==='TEXTAREA'){
-            const start=t.selectionStart,end=t.selectionEnd;
-            if(start===end)return;
-            ev.preventDefault();ev.stopPropagation();
-            let before=t.value.slice(0,start),selected=t.value.slice(start,end),after=t.value.slice(end);
-            // Never place the closing ** on a separate line if a selection
-            // includes its terminal newline or whitespace.
-            const trailing=(selected.match(/[\t \r\n]+$/)||[''])[0];
-            if(trailing){selected=selected.slice(0,-trailing.length);after=trailing+after;}
-            const leading=(selected.match(/^[\t ]+/)||[''])[0];
-            if(leading){before+=leading;selected=selected.slice(leading.length);}
-            if(!selected)return;
-            let replacement;
-            if(selected.startsWith('**')&&selected.endsWith('**')&&selected.length>=4){
-              replacement=selected.slice(2,-2);
-            }else if(before.endsWith('**')&&after.startsWith('**')){
-              before=before.slice(0,-2);after=after.slice(2);replacement=selected;
-            }else{replacement='**'+selected+'**';}
-            const value=before+replacement+after;
-            const nativeSetter=Object.getOwnPropertyDescriptor(window.parent.HTMLTextAreaElement.prototype,'value').set;
-            nativeSetter.call(t,value);
-            t.dispatchEvent(new window.parent.Event('input',{bubbles:true}));
-            t.focus();t.setSelectionRange(before.length,before.length+replacement.length);
-            return;
+    # Register shortcuts in Streamlit's document, not inside a sandboxed iframe.
+    # Requires Streamlit 1.52+ for st.html(unsafe_allow_javascript=True).
+    shortcut_js = r"""<script>
+    (() => {
+      if (window.__rfqShortcutHandler) {
+        document.removeEventListener('keydown', window.__rfqShortcutHandler, true);
+      }
+      const handler = (ev) => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog || !dialog.contains(ev.target)) return;
+        const node = ev.target;
+        const textarea = node instanceof HTMLTextAreaElement ? node : null;
+        const ctrl = ev.ctrlKey || ev.metaKey;
+        if (ctrl && !ev.altKey && ev.key.toLowerCase() === 'b' && textarea) {
+          const start = textarea.selectionStart, end = textarea.selectionEnd;
+          if (start === end) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          let before = textarea.value.slice(0, start);
+          let selected = textarea.value.slice(start, end);
+          let after = textarea.value.slice(end);
+          // Keep trailing whitespace/newlines outside the bold span.
+          const tail = (selected.match(/[\s]+$/) || [''])[0];
+          if (tail) { selected = selected.slice(0, -tail.length); after = tail + after; }
+          const lead = (selected.match(/^[ \t]+/) || [''])[0];
+          if (lead) { before += lead; selected = selected.slice(lead.length); }
+          if (!selected) return;
+          let replacement;
+          if (selected.startsWith('**') && selected.endsWith('**') && selected.length >= 4) {
+            replacement = selected.slice(2, -2);
+          } else if (before.endsWith('**') && after.startsWith('**')) {
+            before = before.slice(0, -2);
+            after = after.slice(2);
+            replacement = selected;
+          } else {
+            replacement = '**' + selected + '**';
           }
-          let label=null;
-          if(ev.ctrlKey&&ev.key==='Enter')label='Verify &';
-          else if(ev.ctrlKey&&ev.key.toLowerCase()==='e')label='Edit';
-          else if(ev.altKey&&ev.key==='ArrowLeft')label='Previous';
-          else if(ev.altKey&&ev.key==='ArrowRight')label='Next';
-          if(!label || (editing && label==='Edit'))return;
-          const button=[...dialog.querySelectorAll('button')].find(b=>!b.disabled&&b.innerText.trim().includes(label));
-          if(button){ev.preventDefault();ev.stopPropagation();button.click();}
+          const value = before + replacement + after;
+          // React/Streamlit expects the native setter + a bubbling input event.
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+          nativeSetter.call(textarea, value);
+          textarea.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          textarea.focus();
+          textarea.setSelectionRange(before.length, before.length + replacement.length);
+          return;
         }
-        doc.__rfqKeyHandler=handler;
-        doc.addEventListener('keydown',handler,true);
-      }catch(e){ /* Browser sandbox may prohibit parent access. */ }
-    })();</script>""",height=0)
+        const typing = textarea || node instanceof HTMLInputElement || node.isContentEditable;
+        if (typing) return;
+        let label;
+        if (ctrl && ev.key === 'Enter') label = 'Verify &';
+        else if (ctrl && ev.key.toLowerCase() === 'e') label = 'Edit';
+        else if (ev.altKey && ev.key === 'ArrowLeft') label = 'Previous';
+        else if (ev.altKey && ev.key === 'ArrowRight') label = 'Next';
+        if (!label) return;
+        const button = [...dialog.querySelectorAll('button')]
+          .find(el => !el.disabled && el.innerText.trim().includes(label));
+        if (button) { ev.preventDefault(); ev.stopPropagation(); button.click(); }
+      };
+      window.__rfqShortcutHandler = handler;
+      document.addEventListener('keydown', handler, true);
+    })();
+    </script>"""
+    st.html(shortcut_js, unsafe_allow_javascript=True)
 
 def review_status(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
