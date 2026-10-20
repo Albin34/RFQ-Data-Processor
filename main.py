@@ -769,35 +769,58 @@ def remove_separator_lines(value):
     return "\n".join(cleaned)
 
 
-def join_pdf_wrapped_lines(note):
-    """Join wrapped narrative values, retaining one line per named attribute.
+def normalize_technical_punctuation(text):
+    """Light-touch formatting of punctuation without changing measurements/codes."""
+    # Preserve digits, punctuation within model numbers and decimal separators.
+    # Add a space after a field colon, except inside numeric ratios/times.
+    text = re.sub(r"(?<=[A-Za-z]):(?=[A-Za-z0-9])", ": ", text)
+    # A comma followed immediately by prose gets a space; never change 1,000.
+    text = re.sub(r"(?<=[A-Za-z0-9]),(?=[A-Za-z])", ", ", text)
+    return text
 
-    Never silently rewrite a technical value. In particular, broken words such
-    as 'MA' + 'TERIAL' remain explicit for human verification unless the split
-    is unambiguous and configured separately.
+
+def join_pdf_wrapped_lines(note):
+    """Reflow wrapped Fertil technical specifications while retaining field boundaries.
+
+    A line ending in an unfinished label/value is joined to its continuation.
+    Explicit new uppercase field labels remain on separate lines; unrecognized
+    fragments are kept in the previous technical paragraph where safe.
     """
     lines = [normalize_pdf_symbols(line.strip()) for line in str(note).splitlines()]
     heading = re.compile(r"^(?:BASIC DATA TEXT|CLASSIFICATION TEXT|MPN TEXT|INSPECTION TEXT|PO MATERIAL TEXT|MPN DETAILS|CHARACTERISTICS|TAG NOS)\s*:?$", re.I)
-    attribute = re.compile(r"^[A-Z][A-Z0-9 /()_.#-]{1,70}\s*:\s*\S", re.I)
-    narrative_label = re.compile(
-        r"^(?:ADDITIONAL INFORMATION(?:\s*\(CONTD\d+\))?|PRE-QUOTE\d*|PRE-SHIPMENT\d*|PRE-ORDER CONDITION\d*|STANDARD|SPECIFICATION|REMARKS?|NOTES?|DRAWING NUMBER|HARDNESS)\s*:", re.I)
+    field = re.compile(r"^[A-Z][A-Z0-9 /()_.#-]{1,75}\s*:\s*", re.I)
+    narrative = re.compile(r"^(?:ADDITIONAL INFORMATION|PRE-QUOTE|PRE-SHIPMENT|PRE-ORDER CONDITION|STANDARD|SPECIFICATION|REMARKS?|NOTES?|DRAWING NUMBER|HARDNESS)\b", re.I)
     out = []
-    joining = False
     for line in lines:
         if not line:
-            if out and out[-1] != "":
-                out.append("")
-            joining = False
-        elif heading.fullmatch(line):
+            if out and out[-1] != "": out.append("")
+            continue
+        line = normalize_technical_punctuation(line)
+        if not out or heading.fullmatch(line):
             out.append(line)
-            joining = False
-        elif attribute.match(line):
+            continue
+        prev = out[-1]
+        if not prev:
             out.append(line)
-            joining = bool(narrative_label.match(line))
-        elif out and out[-1] and joining:
-            out[-1] = out[-1].rstrip() + " " + line
-        else:
+            continue
+        # A named field beginning a fresh specification must start a new line.
+        # Except a nested sub-field within an already wrapped EQUIPMENT SPECS.
+        if field.match(line) and not (prev.upper().startswith(('EQUIPMENT SPECS', 'ADDITIONAL INFORMATION'))
+                                      and re.match(r"^(?:PRESSURE|KG/CM2|VALVE ORIFICE|SET PRESSURE|BACK PRESSURE|CAPACITY|MATERIAL|TRIM MATERIAL|INLET|OUTLET)\b",line,re.I)):
             out.append(line)
+            continue
+        if prev.endswith((':', ',', ';', '-', '/', '&')) or re.search(r"\b(?:SET|VALVE|BODY|TRIM|SPIR|REL[VW]G\.?|INLET|OUTLET|MATERIAL|PRESSURE)\s*$",prev,re.I):
+            out[-1] = prev.rstrip() + " " + line
+            continue
+        if narrative.match(prev) or prev.upper().startswith(('EQUIPMENT SPECS', 'ADDITIONAL INFORMATION')):
+            out[-1] = prev.rstrip() + " " + line
+            continue
+        # Wrapped part numbers after '&' and drawing/tag values.
+        if re.match(r"^[A-Z0-9][A-Z0-9./#-]*(?:\s+[A-Z0-9./#-]+)*$",line) and (
+                re.search(r"(?:PART NUMBER|DRAWING NUMBER|EQUIPMENT TAG NUMBER)\s*:",prev,re.I)):
+            out[-1] = prev.rstrip() + " " + line
+            continue
+        out.append(line)
     return "\n".join(out).strip()
 
 def format_tabular_pdf_note(note):
@@ -1059,7 +1082,7 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
       border:1px solid #aebccd;border-radius:12px;padding:14px;box-sizing:border-box;min-width:0;width:100%}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;line-height:1.65;font:12.5px ui-monospace,Consolas,monospace}
     .missing{color:#bd1e32;font-weight:600}.excluded{color:#0868a8}
-    .matched{color:#14532d}.normal{color:#172033}
+    .matched{color:#087735}.normal{color:#172033}
     .legend{font:12px system-ui;color:#a6b6cb;margin:8px 0 0}
     @media(max-width:620px){.grid{grid-template-columns:1fr}.panel{height:240px}}
     </style></head><body><div class="grid">
@@ -1341,7 +1364,7 @@ def colored_reference(original, formatted, panel_height=None, format_style="defa
         style = {
             "missing": "color:#bd1e32;font-weight:600",
             "excluded": "color:#0868a8",
-            "matched": "color:#14532d",
+            "matched": "color:#087735",
             "normal": "color:#172033",
         }.get(cls, "color:#172033")
         highlighted_lines.append(
@@ -1459,7 +1482,7 @@ def review_popup(session_prefix):
     with b:
         st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label rfq-red">Critical warnings</div><div class="rfq-stat-count rfq-red">{critical}</div></div>', unsafe_allow_html=True)
     with c:
-        st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label">Remaining</div><div class="rfq-stat-count">{len(queue)-done}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="rfq-review-stat"><div class="rfq-stat-label">Remaining</div><div class="rfq-stat-count">{sum(not q["verified"] for q in queue)}</div></div>', unsafe_allow_html=True)
     # Separate the warning cards from the scrolling toggle. Streamlit Markdown
     # blocks may size slightly shorter than their internal card on some browsers.
     st.markdown('<div style="height:16px;clear:both" aria-hidden="true"></div>', unsafe_allow_html=True)
@@ -1545,8 +1568,8 @@ def review_popup(session_prefix):
         warnings = validate_rfq(q["source"], plain_review_text(current_desc), q.get("style", "default"), q.get("desc", ""))
         severity = (" (🔴 Critical Warning)" if any(w["priority"] == "Critical" for w in warnings)
                     else " (🟠 Technical Warning)" if warnings else "")
-        status = "✓ Verified" if q["verified"] else "Pending"
-        return f"Line {q['line']} · {status}{severity}"
+        status = "" if q["verified"] else " · Pending"
+        return f"Line {q['line']}{status}{severity}"
     with nav_col:
         st.markdown("<div class='rfq-nav-label'>Jump to line item</div>", unsafe_allow_html=True)
         picked = st.selectbox("Jump to line item", options=list(range(len(queue))), index=position,
