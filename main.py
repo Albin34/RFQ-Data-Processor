@@ -1162,6 +1162,19 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     return stats
 
 
+def repair_split_bold_markers(text):
+    """Rejoin an orphan closing ** with the preceding bolded line.
+
+    Ctrl+B selections can include a trailing newline. This normalizes older
+    drafts without joining independent technical specification lines.
+    """
+    text = str(text or "")
+    return re.sub(
+        r"(?m)^(\*\*[^\n]*?\S)[ \t]*\n[ \t]*\*\*[ \t]*(?=\n|$)",
+        r"\1**", text,
+    )
+
+
 def editor_bold_markers(text):
     """Expose automatically bold technical lines using editable **...** markers.
 
@@ -1169,7 +1182,7 @@ def editor_bold_markers(text):
     Already marked lines remain untouched to preserve manually toggled styling.
     """
     output = []
-    for line in str(text).split("\n"):
+    for line in repair_split_bold_markers(text).split("\n"):
         if BOLD_TECHNICAL_LINE.match(plain_review_text(line)) and "**" not in line:
             output.append("**" + line + "**")
         else:
@@ -1200,7 +1213,7 @@ def _save_current(review, prefix):
         if value is None or (not str(value).strip() and str(item["source"]).strip()):
             st.error("The formatted editor is empty. Restore or enter text before leaving this item.")
             return False
-        item["formatted"] = value
+        item["formatted"] = repair_split_bold_markers(value)
         item["manufacturer"] = st.session_state.get(f"editablemaker_{prefix}_{pos}", item["manufacturer"])
     else:
         value = st.session_state.get(f"formatted_{prefix}_{pos}", item["formatted"])
@@ -1308,12 +1321,12 @@ BOLD_MARKERS = re.compile(r"\*\*(.+?)\*\*", re.S)
 
 def plain_review_text(text):
     """Strip explicit bold markers only; leave source values untouched."""
-    return str(text).replace("**", "")
+    return repair_split_bold_markers(text).replace("**", "")
 
 
 def working_sheet_rich_text(text):
     """Turn manual emphasis and manufacturer/part-number lines into Excel runs."""
-    source = str(text or "")
+    source = repair_split_bold_markers(text)
     segments = []
     for line in source.splitlines(keepends=True):
         auto_bold = bool(BOLD_TECHNICAL_LINE.match(line))
@@ -1700,6 +1713,7 @@ def review_popup(session_prefix):
             not str(st.session_state[edit_text_key]).strip() and str(item["formatted"]).strip()
         ):
             st.session_state[edit_text_key] = editor_bold_markers(item["formatted"])
+        st.session_state[edit_text_key] = repair_split_bold_markers(st.session_state[edit_text_key])
         st.session_state.setdefault(edit_maker_key, item["manufacturer"])
         left_panel, right_panel = st.columns([1, 1], gap="medium")
         with left_panel:
@@ -1808,6 +1822,13 @@ def review_popup(session_prefix):
             if(start===end)return;
             ev.preventDefault();ev.stopPropagation();
             let before=t.value.slice(0,start),selected=t.value.slice(start,end),after=t.value.slice(end);
+            // Never place the closing ** on a separate line if a selection
+            // includes its terminal newline or whitespace.
+            const trailing=(selected.match(/[\t \r\n]+$/)||[''])[0];
+            if(trailing){selected=selected.slice(0,-trailing.length);after=trailing+after;}
+            const leading=(selected.match(/^[\t ]+/)||[''])[0];
+            if(leading){before+=leading;selected=selected.slice(leading.length);}
+            if(!selected)return;
             let replacement;
             if(selected.startsWith('**')&&selected.endsWith('**')&&selected.length>=4){
               replacement=selected.slice(2,-2);
