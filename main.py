@@ -805,6 +805,9 @@ def format_tabular_pdf_note(note):
         return "", ""
 
     formatted = join_pdf_wrapped_lines(note)
+    # A tabular item's first sentence is exported as Description, not as part
+    # of the formatted PO Text. Strip it even if it leaked into the note.
+    # (The caller passes a separate description when preparing review.)
     # Group some related fields visually, without changing PDF upload text.
     output = []
     group_start = re.compile(
@@ -1009,7 +1012,7 @@ def _classification(line, draft, format_style):
         return "excluded"
     if re.match(r"^[\w /().-]+\s*:\s*(?:-+|N/?A)?$", val, re.I) and val.casefold() not in {"characteristics :", "mpn details"}:
         return "excluded"
-    if _multiset_contains(val, draft):
+    if _multiset_contains(val, plain_review_text(draft)):
         return "matched"
     return "missing"
 
@@ -1029,7 +1032,21 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
         stats[cls] += 1
         rendered.append('<span class="' + cls + '">' + html.escape(line) + '</span>')
     left = "\n".join(rendered)
-    right = html.escape(formatted)
+    right_lines = []
+    for line in formatted.splitlines():
+        display = html.escape(line)
+        parts = []
+        offset = 0
+        for m in BOLD_MARKERS.finditer(line):
+            parts.append(html.escape(line[offset:m.start()]))
+            parts.append('<strong>' + html.escape(m.group(1)) + '</strong>')
+            offset = m.end()
+        parts.append(html.escape(line[offset:]))
+        display = ''.join(parts)
+        if BOLD_TECHNICAL_LINE.match(plain_review_text(line)):
+            display = '<strong>' + display + '</strong>'
+        right_lines.append(display)
+    right = "\n".join(right_lines)
     document = """<!doctype html><html><head><meta charset="utf-8"><style>
     html,body{margin:0;background:transparent;color:#eef2fa;font:13px ui-monospace,Consolas,monospace}
     *{box-sizing:border-box}
@@ -1114,6 +1131,11 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
                                    else process_rfq_text(note))
         formatted = space_after_initial_section_header(formatted)
         is_table = format_style == "tabular_pdf"
+        if is_table:
+            desc_clean = str(desc).strip()
+            lines = formatted.splitlines()
+            if lines and lines[0].strip().casefold() == desc_clean.casefold():
+                formatted = "\n".join(lines[1:]).lstrip("\n")
         # On this PDF layout the first line is the description. Show that full
         # original item in the left reference, but keep PO Text separate for export.
         source = (str(desc).strip() + "\n" + _clean(note)).strip() if is_table else _clean(note)
@@ -1150,6 +1172,7 @@ BOLD_TECHNICAL_LINE = re.compile(
     r"manufacturer\s*[:：]|mfr\.?\s*[:：]|"
     r"mfg\s*[:：]|make\s*[:：]|"
     r"part\s*(?:no\.?|number)\s*[:：]|"
+    r"item\s*[-–]?\s*manufacturer\s*part\s*(?:no\.?|number)\s*[:：]|"
     r"(?:mfr|oem|smg|supplier)\s+part\s*(?:no\.?|number)\s*[:：])",
     re.I,
 )
@@ -1183,7 +1206,7 @@ def working_sheet_rich_text(text):
         if not value:
             continue
         if is_bold:
-            result.append(TextBlock(InlineFont(b=True, rFont="Aptos Narrow"), value))
+            result.append(TextBlock(InlineFont(b=True, rFont="Aptos Narrow", sz=11), value))
         else:
             result.append(value)
     return result
@@ -1225,7 +1248,14 @@ def finalize_verified(session_prefix):
         if other is not sheet:
             wb.remove(other)
     wrap_all(sheet)
-    st.session_state[f"{session_prefix}_final_bytes"] = workbook_bytes(wb)
+    output_bytes = workbook_bytes(wb)
+    # Reopen the exact generated file to catch malformed OOXML before delivery.
+    try:
+        reopened = load_workbook(BytesIO(output_bytes), read_only=False, rich_text=True)
+        reopened.close()
+    except Exception as exc:
+        raise ValueError(f"Working Sheet failed XLSX validation: {exc}") from exc
+    st.session_state[f"{session_prefix}_final_bytes"] = output_bytes
     if review["upload_bytes"] is not None:
         st.session_state[f"{session_prefix}_upload_bytes"] = review["upload_bytes"]
     st.session_state[f"{session_prefix}_suffix"] = review["suffix"]
@@ -1291,6 +1321,11 @@ def confirm_verify_all_popup(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
     if not review or review.get("completed"):
         return
+    st.markdown("""<style>
+    div[data-testid="stDialog"] [role="dialog"] {box-sizing:border-box;max-width:min(94vw,580px)!important;min-width:0!important}
+    div[data-testid="stDialog"] [role="dialog"] [data-testid="stVerticalBlock"] {min-width:0}
+    div[data-testid="stDialog"] [role="dialog"] [data-testid="stAlert"] {max-width:100%;overflow-wrap:anywhere;box-sizing:border-box}
+    </style>""",unsafe_allow_html=True)
     st.warning("Confirm to skip the verification process at your own risk")
     st.caption("This will approve every remaining line without individual review.")
     yes_col, no_col = st.columns(2)
@@ -1374,7 +1409,7 @@ def review_popup(session_prefix):
     draft = (st.session_state.get(edit_text_key, item["formatted"]) if item["editing"]
              else st.session_state.get(text_key, item["formatted"]))
     desc = st.session_state.get(desc_key, item["desc"]) if item.get("tabular_pdf") else ""
-    compared = (desc + "\n" + plain_review_text(draft)).strip() if item.get("tabular_pdf") else plain_review_text(draft)
+    compared = plain_review_text(draft)
     issues = validate_rfq(item["source"], plain_review_text(draft), item.get("style","default"), desc)
     critical = sum(x["priority"] == "Critical" for x in issues)
     a,b,c = st.columns([1,1,1])
@@ -1517,40 +1552,46 @@ def review_popup(session_prefix):
     st.caption("Shortcuts: when the comparison panel is focused, Alt+←/→ navigates and Ctrl+Enter verifies; Ctrl+E edits. Browser shortcuts can take precedence. Buttons always work.")
     # The iframe may access parent buttons on some Streamlit/browser versions.
     # If the browser isolates the component, visible buttons still provide the controls.
-    components.html("""<script>(function(){try{const doc=window.parent.document;
-        if(doc.__rfqKeysInstalled)return;doc.__rfqKeysInstalled=true;
-        doc.addEventListener('keydown',function(ev){
-          if(ev.ctrlKey && !ev.altKey && !ev.metaKey && ev.key.toLowerCase()==='b'){
-            const box=ev.target;
-            if(box.tagName==='TEXTAREA' && box.closest('[role=dialog]')){
-              const selected=box.value.substring(box.selectionStart,box.selectionEnd);
-              if(!selected)return;
-              ev.preventDefault();
-              const start=box.selectionStart,end=box.selectionEnd;
-              const before=box.value.substring(0,start),after=box.value.substring(end);
-              let insert=selected;
-              if(before.endsWith('**') && after.startsWith('**')){
-                box.setRangeText(selected,start-2,end+2,'select');
-              }else if(selected.startsWith('**') && selected.endsWith('**') && selected.length>=4){
-                box.setRangeText(selected.substring(2,selected.length-2),start,end,'select');
-              }else{
-                box.setRangeText('**'+selected+'**',start,end,'select');
-              }
-              box.dispatchEvent(new Event('input',{bubbles:true}));
-              return;
-            }
+    components.html("""<script>(function(){
+      try {
+        const doc=window.parent.document;
+        if(doc.__rfqKeyHandler) doc.removeEventListener('keydown',doc.__rfqKeyHandler,true);
+        function handler(ev){
+          const dialog=doc.querySelector('[role=dialog]');
+          if(!dialog || !dialog.contains(ev.target))return;
+          const t=ev.target;
+          const editing=t.tagName==='TEXTAREA' || t.tagName==='INPUT' || t.isContentEditable;
+          if((ev.ctrlKey||ev.metaKey) && !ev.altKey && ev.key.toLowerCase()==='b' && t.tagName==='TEXTAREA'){
+            const start=t.selectionStart,end=t.selectionEnd;
+            if(start===end)return;
+            ev.preventDefault();ev.stopPropagation();
+            let before=t.value.slice(0,start),selected=t.value.slice(start,end),after=t.value.slice(end);
+            let replacement;
+            if(selected.startsWith('**')&&selected.endsWith('**')&&selected.length>=4){
+              replacement=selected.slice(2,-2);
+            }else if(before.endsWith('**')&&after.startsWith('**')){
+              before=before.slice(0,-2);after=after.slice(2);replacement=selected;
+            }else{replacement='**'+selected+'**';}
+            const value=before+replacement+after;
+            const nativeSetter=Object.getOwnPropertyDescriptor(window.parent.HTMLTextAreaElement.prototype,'value').set;
+            nativeSetter.call(t,value);
+            t.dispatchEvent(new window.parent.Event('input',{bubbles:true}));
+            t.focus();t.setSelectionRange(before.length,before.length+replacement.length);
+            return;
           }
-          if(ev.target.closest('textarea,input,[contenteditable=true]'))return;
           let label=null;
           if(ev.ctrlKey&&ev.key==='Enter')label='Verify &';
           else if(ev.ctrlKey&&ev.key.toLowerCase()==='e')label='Edit';
           else if(ev.altKey&&ev.key==='ArrowLeft')label='Previous';
           else if(ev.altKey&&ev.key==='ArrowRight')label='Next';
-          if(!label)return;
-          const dialog=doc.querySelector('[role=dialog]');if(!dialog)return;
-          const btn=[...dialog.querySelectorAll('button')].find(b=>!b.disabled&&b.innerText.trim().includes(label));
-          if(btn){ev.preventDefault();btn.click();}
-        });}catch(_e){} })();</script>""",height=0)
+          if(!label || (editing && label==='Edit'))return;
+          const button=[...dialog.querySelectorAll('button')].find(b=>!b.disabled&&b.innerText.trim().includes(label));
+          if(button){ev.preventDefault();ev.stopPropagation();button.click();}
+        }
+        doc.__rfqKeyHandler=handler;
+        doc.addEventListener('keydown',handler,true);
+      }catch(e){ /* Browser sandbox may prohibit parent access. */ }
+    })();</script>""",height=0)
 
 def review_status(session_prefix):
     review = st.session_state.get(f"{session_prefix}_review")
