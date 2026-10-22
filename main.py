@@ -491,6 +491,7 @@ def _nawah_excel_records(book, rfq_number):
     diagnostics = []
     material_re = re.compile(r"^\s*(\d{8,12})\s+(.+?)\s*$", re.S)
     marker_re = re.compile(r"^\s*6[.]([0-9]+)(?:[.]0+)?\s*$")
+    item_number_re = re.compile(r"^\s*(?:6\.)?([0-9]{1,4})(?:\.0+)?\s*$")
     qty_re = re.compile(r"^\d{1,3}(?:,\d{3})*(?:\.0+)?$|^\d+(?:\.0+)?$")
     units = {"piece": "EA", "pieces": "EA", "each": "EA", "ea": "EA",
              "set": "SET", "sets": "SET", "pc": "PC", "pcs": "PCS",
@@ -527,8 +528,36 @@ def _nawah_excel_records(book, rfq_number):
             before_note = [c for c in material_candidates if c[0] < note_col]
             mat_col, match = (before_note or material_candidates)[-1]
             material, embedded_description = match.groups()
-            marker = next((marker_re.fullmatch(v) for v in row if marker_re.fullmatch(v)), None)
-            ordinal = int(marker.group(1)) if marker else len(records) + 1
+            # 'ARIBA Number' is the bidding grid's original item number,
+            # NOT the index of the extracted rows. Some Nawah workbooks start
+            # at item 4 (or later), so len(records)+1 silently corrupts it.
+            marker = next((marker_re.fullmatch(v) for v in row[:mat_col]
+                           if marker_re.fullmatch(v)), None)
+            explicit_item = None
+            for heading in ("number", "item number", "item", "lot number"):
+                col = headings.get(heading)
+                if col is not None and col < mat_col:
+                    match_number = item_number_re.fullmatch(row[col])
+                    if match_number:
+                        explicit_item = int(match_number.group(1))
+                        break
+            if marker is not None:
+                ordinal = int(marker.group(1))
+            elif explicit_item is not None:
+                ordinal = explicit_item
+            else:
+                # On older Nawah grids the numbered item cell may be an
+                # unlabelled column to the left of Material Code.
+                early_cells = row[:min(mat_col, 5)]
+                candidate_numbers = [item_number_re.fullmatch(v) for v in early_cells]
+                candidate_numbers = [m for m in candidate_numbers if m]
+                if not candidate_numbers:
+                    raise ValueError(
+                        f"Nawah sheet {sheet_name!r}, row {ridx+1}, material {material}: "
+                        "source ARIBA item number not identified. "
+                        "Please check the original Number column."
+                    )
+                ordinal = int(candidate_numbers[0].group(1))
             if ordinal < 1:
                 continue
 
@@ -571,14 +600,14 @@ def _nawah_excel_records(book, rfq_number):
             # Uploading Sheet and reduced only in the Working Sheet formatter.
             records.append({
                 "RFx Number": rfq_number,
-                "RFx Item No": str(ordinal * 10),
+                "RFx Item No": str((len(records) + 1) * 10),
                 "PR Item No": "",
                 "Material No": material,
                 "Description": description,
                 "PO Text": note,
                 "QTY": qty,
                 "UOM": unit,
-                "ARIBA Number": f"6.{ordinal}" if marker else str(ordinal),
+                "ARIBA Number": str(ordinal),
             })
         diagnostics.append(f"{sheet_name}: {len(rows)} rows")
     unique = {}
