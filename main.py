@@ -283,18 +283,11 @@ def format_rfq_python(text):
             sections["Basic Data Text"] = po_lines
             sections["PO Material Text"] = []
 
-    # Collapse exact adjacent/nonadjacent duplicates ONLY in a single section.
-    # Preserve duplicate PO, basic and inspection lines because they can convey
-    # distinct requirements despite identical wording; MPN repeats are commonly
-    # duplicated by SAP and are safe to consolidate exactly.
-    mpn = sections["MPN Text"]
-    seen = set()
-    deduped = []
-    for line in mpn:
-        if line not in seen:
-            deduped.append(line)
-            seen.add(line)
-    sections["MPN Text"] = deduped
+    # Preserve every MPN occurrence in its original manufacturer/OEM context.
+    # The same part number can correspond to different manufacturer numbers,
+    # drawings, OEM models, serial numbers, and equipment positions.
+    # Deduplicating individual lines destroys these associations.
+    # Any genuinely repeated blocks remain visible for human verification.
 
     # Keep each manufacturer and its corresponding part number together.
     # Insert a blank line only when the previous pair is complete and a
@@ -1129,11 +1122,20 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     original_lines = original.splitlines()
     rendered = []
     stats = Counter()
+    # A source line occurring twice must also occur twice in the draft.
+    # Otherwise, highlight the missing occurrence even when the first matches.
+    available_counts = Counter(compare_normalize(line) for line in plain_review_text(formatted).splitlines() if line.strip())
     in_quality = False
     for line in original_lines:
         if style.startswith("nawah") and re.match(r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
             in_quality = True
         cls = _classification(line, formatted, style)
+        key = compare_normalize(line)
+        if cls == "matched" and key:
+            if available_counts[key] > 0:
+                available_counts[key] -= 1
+            else:
+                cls = "missing"
         if in_quality and style.startswith("nawah") and cls == "missing":
             cls = "excluded"  # Nawah quality boilerplate is summarized intentionally.
         stats[cls] += 1
@@ -1574,11 +1576,18 @@ def colored_reference(original, formatted, panel_height=None, format_style="defa
     """Use the same source-line classification as non-editing preview."""
     highlighted_lines = []
     in_quality = False
+    available_counts = Counter(compare_normalize(line) for line in plain_review_text(formatted).splitlines() if line.strip())
     for line in original.splitlines():
         if format_style.startswith("nawah") and re.match(
                 r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
             in_quality = True
         cls = _classification(line, formatted, format_style)
+        key = compare_normalize(line)
+        if cls == "matched" and key:
+            if available_counts[key] > 0:
+                available_counts[key] -= 1
+            else:
+                cls = "missing"
         if in_quality and format_style.startswith("nawah") and cls == "missing":
             cls = "excluded"
         style = {
