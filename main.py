@@ -283,6 +283,14 @@ def format_rfq_python(text):
             sections["Basic Data Text"] = po_lines
             sections["PO Material Text"] = []
 
+    # Correct the known duplicated PDF/Excel text-fragment extraction artifact.
+    # Do not remove unrelated text: this is a highly specific repeat pattern.
+    for section_lines in sections.values():
+        for i, value in enumerate(section_lines):
+            section_lines[i] = re.sub(
+                r"(?i)(\baccompany this part\.)ompany this part\.",
+                r"\1", value)
+
     # Preserve every MPN occurrence in its original manufacturer/OEM context.
     # The same part number can correspond to different manufacturer numbers,
     # drawings, OEM models, serial numbers, and equipment positions.
@@ -312,6 +320,13 @@ def format_rfq_python(text):
         separated_mpn.append(line)
         seen_part = seen_part or is_part_number
         seen_manufacturer = seen_manufacturer or is_manufacturer_number
+    # Separate first MPN record from the MPN Details heading, and preserve
+    # a blank line between different OEM/manufacturer records.
+    for first, value in enumerate(separated_mpn):
+        if re.match(r"^Manufacturer\s+(?:Part\s+Number|number)\s*:", value, re.I):
+            if first > 0 and separated_mpn[first-1] != "":
+                separated_mpn.insert(first, "")
+            break
     sections["MPN Text"] = separated_mpn
 
     chunks = []
@@ -1110,6 +1125,10 @@ def _classification(line, draft, format_style):
         return "excluded"
     if format_style.startswith("nawah") and re.search(r"COMMERCIAL QA|AUGMENTED QUALITY|GENERAL PACKAGING|START OF MESSAGE CODE|END OF MESSAGE CODE", val, re.I):
         return "excluded"
+    # Empty placeholders are intentionally removed, but --- markers should
+    # be RED in the source so reviewers can verify their removal explicitly.
+    if re.match(r"^[\w /().-]+\s*:\s*-{3,}\s*$", val, re.I):
+        return "missing"
     if re.match(r"^[\w /().-]+\s*:\s*(?:-+|N/?A)?$", val, re.I) and val.casefold() not in {"characteristics :", "mpn details"}:
         return "excluded"
     if _multiset_contains(val, plain_review_text(draft)):
