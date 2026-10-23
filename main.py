@@ -143,6 +143,14 @@ def normalize_qty(value):
         return value
     return value
 
+def checked_excel_value(value, context="Excel cell"):
+    """Reject oversized text before openpyxl can silently truncate it."""
+    if isinstance(value, str) and len(value.encode("utf-16-le")) // 2 > 32767:
+        raise ValueError(f"{context}: text exceeds Excel's 32,767-character cell limit. "
+                         "Shorten the note or split it into separate cells before exporting.")
+    return value
+
+
 def workbook_bytes(workbook):
     """Export workbooks using Aptos Narrow without changing other cell styles."""
     for worksheet in workbook.worksheets:
@@ -150,13 +158,29 @@ def workbook_bytes(workbook):
             for cell in row:
                 if cell.value is None and not cell.has_style:
                     continue
+                checked_excel_value(cell.value, f"{worksheet.title}!{cell.coordinate}")
                 current_font = copy(cell.font)
                 if current_font.name != "Aptos Narrow":
                     current_font.name = "Aptos Narrow"
                     cell.font = current_font
     buffer = BytesIO()
     workbook.save(buffer)
-    return buffer.getvalue()
+    data = buffer.getvalue()
+    reopened = load_workbook(BytesIO(data), read_only=True)
+    try:
+        for worksheet in workbook.worksheets:
+            saved_rows = reopened[worksheet.title].iter_rows(
+                max_row=worksheet.max_row, max_col=worksheet.max_column)
+            for row, saved_row in zip(worksheet.iter_rows(), saved_rows):
+                for cell, saved_cell in zip(row, saved_row):
+                    if isinstance(cell.value, str):
+                        if cell.value == "" and saved_cell.value is None:
+                            continue  # Excel stores empty strings as blank cells.
+                        if saved_cell.value != cell.value:
+                            raise ValueError(f"Export changed text in {worksheet.title}!{cell.coordinate}")
+    finally:
+        reopened.close()
+    return data
 
 def wrap_all(worksheet):
     for row in worksheet.iter_rows():
@@ -320,11 +344,11 @@ def format_rfq_python(text):
         separated_mpn.append(line)
         seen_part = seen_part or is_part_number
         seen_manufacturer = seen_manufacturer or is_manufacturer_number
-    # Separate first MPN record from the MPN Details heading, and preserve
+    # Separate first MPN record from the MPN Text or MPN Details heading, and preserve
     # a blank line between different OEM/manufacturer records.
     for first, value in enumerate(separated_mpn):
         if re.match(r"^Manufacturer\s+(?:Part\s+Number|number)\s*:", value, re.I):
-            if first > 0 and separated_mpn[first-1] != "":
+            if first == 0 or separated_mpn[first-1] != "":
                 separated_mpn.insert(first, "")
             break
     sections["MPN Text"] = separated_mpn
@@ -389,14 +413,15 @@ def parse_pdf(body, full_rfq_text):
         if not start_pattern.fullmatch(value):
             continue
         following = lines[i+1:i+12]
-        if len(following) < 7 or not material_pattern.fullmatch(following[0]):
+        # A numbered row followed by a material ID is an item candidate even
+        # when its remaining fields are malformed. Never silently drop it.
+        if not following or not re.fullmatch(r"B?\d{8,14}", following[0]):
             continue
-        if not re.fullmatch(r"[\d,]+(?:\.\d+)?", following[1]):
-            continue
-        if not re.fullmatch(r"[A-Za-z]{1,8}", following[2]):
-            continue
-        if not any(date_pattern.fullmatch(v) for v in following[3:10]):
-            continue
+        if (len(following) < 7 or not material_pattern.fullmatch(following[0])
+                or not re.fullmatch(r"[\d,]+(?:\.\d+)?", following[1])
+                or not re.fullmatch(r"[A-Za-z]{1,8}", following[2])
+                or not any(date_pattern.fullmatch(v) for v in following[3:10])):
+            raise ValueError(f"ADNOC item {value}: incomplete or unsupported item fields; no partial import was produced.")
         candidates.append(i)
     for number, idx in enumerate(candidates):
         next_idx = candidates[number+1] if number+1 < len(candidates) else len(lines)
@@ -404,7 +429,7 @@ def parse_pdf(body, full_rfq_text):
         segment = lines[idx:next_idx]
         short_pos = next((j for j, v in enumerate(segment) if re.match(r"^Short Text\s*:",v,re.I)), None)
         if short_pos is None:
-            continue
+            raise ValueError(f"ADNOC item {lines[idx]}: Short Text is missing; no partial import was produced.")
         short_text = re.sub(r"^Short Text\s*:\s*", "", segment[short_pos], flags=re.I)
         # Stop at Agreement/LineNo., plant/storage, or footer content.
         stop_pos = next((j for j in range(short_pos+1,len(segment))
@@ -414,78 +439,48 @@ def parse_pdf(body, full_rfq_text):
         po_lines = block[po_start+1:] if po_start is not None else block
         # Keep section boundaries, blank lines and all substantive content.
         note = "\n".join(po_lines).strip()
+        if not short_text.strip() or not note:
+            raise ValueError(f"ADNOC item {lines[idx]}: description or PO Text is empty; no partial import was produced.")
         results.append({"RFx Number":rfq_number,
                         "RFx Item No":str(int(lines[idx])),
                         "PR Item No":"", "Material No":lines[idx+1],
                         "Description":short_text, "PO Text":note,
                         "QTY":lines[idx+2], "UOM":lines[idx+3]})
     if results:
+        detected = re.findall(r"(?m)^\s*\d{5}\s+B?\d{8,14}(?=\s|$)", full_rfq_text)
+        if len(detected) != len(results):
+            raise ValueError("ADNOC detected and imported item counts differ; no partial import was produced.")
         return results
     # Preserve support for unusual legacy exports where item fields are inline.
     pattern = re.compile(r"(\d{5})\s+(\w?12\d{10})\s+(\d+(?:\.\d+)?)\s+(\w+)\s+.*?(\d{2}\.\d{2}\.\d{4})", re.S)
-    items = pattern.findall(body)
-    shorts = re.findall(r"Short Text :(.*?)\n", body, re.S)
-    notes = re.findall(r"PO Material Text :(.*?)Agreement / LineNo\.", body, re.S)
-    for i, item in enumerate(items):
+    items = list(pattern.finditer(body))
+    # Associate text with its own item block instead of zipping independent
+    # lists, which shifts descriptions/notes after a missing field.
+    broad_heads = list(re.finditer(r"(?m)^\s*\d{5}\s+B?\d{8,14}\s+", body))
+    if len(broad_heads) > len(items):
+        raise ValueError("ADNOC item headers could not all be parsed; no partial import was produced.")
+    for i, found in enumerate(items):
+        item = found.groups()
+        block = body[found.start():items[i+1].start() if i+1 < len(items) else len(body)]
+        short = re.search(r"Short Text\s*:\s*([^\n]+)", block, re.I)
+        note = re.search(r"PO Material Text\s*:(.*?)Agreement\s*/\s*LineNo\.", block, re.I | re.S)
+        if short is None or note is None or not note.group(1).strip():
+            raise ValueError(f"ADNOC item {item[0]}: description or PO Text is missing; no partial import was produced.")
         results.append({"RFx Number":rfq_number, "RFx Item No":str(int(item[0])),
                         "PR Item No":"", "Material No":item[1],
-                        "Description":shorts[i].strip() if i<len(shorts) else "",
-                        "PO Text":notes[i].strip() if i<len(notes) else "",
+                        "Description":short.group(1).strip(),
+                        "PO Text":note.group(1).strip(),
                         "QTY":item[2], "UOM":item[3]})
     return results
 
 def summarize_nawah_working_note(raw):
-    """Preserve Nawah material details and concisely list explicit QA deliverables.
+    """Preserve Nawah material details and all source quality obligations.
 
-    General commercial QA/packaging boilerplate is omitted from Working Sheet,
-    but nuclear safety status and code documents are not silently discarded.
-    The unmodified original remains in the Uploading Sheet/review reference.
+    Keep the established entry point for both Nawah import paths. Requirements
+    are retained verbatim rather than selected by a fixed certificate allowlist.
     """
-    source = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
-    source = re.sub(r"\*{4,}\s*;?\s*Material PO text\s*:\s*\*{4,}",
-                    "Material PO Text:", source, flags=re.I)
-    source = re.sub(r"^\s*\[Material PO Text\]\s*$", "Material PO Text:",
-                    source, flags=re.I | re.M)
-    # Some Nawah RFQs omit the literal QUALITY REQUIREMENTS header and
-    # begin directly with their first START OF MESSAGE CODE.
-    cut = re.search(
-        r"^\s*(?:QUALITY REQUIREMENTS?\s*:?\s*|START OF MESSAGE CODE\s+Z_NPE_[^\n]+)\s*$",
-        source, re.I | re.M)
-    if cut is None:
-        marker = re.search(r"^\s*\*{8,}\s*$\n\s*START OF MESSAGE CODE", source, re.I | re.M)
-        if marker:
-            cut = marker
-    material = (source[:cut.start()] if cut else source).strip()
-    material = re.sub(r"^\s*Material PO Text\s*:\s*", "", material, flags=re.I)
-    quality = source[cut.start():] if cut else ""
+    return format_nawah_pdf_note(raw)
 
-    # Do not infer a certificate from generic boilerplate mentions such as
-    # traceability of sub-tier certifications. Detect explicit named requirements.
-    definitions = [
-        (r"Z_NPE_CERT OF CONFORMANCE|^\s*CERTIFICATE OF CONFORMANCE\s*$", "CERTIFICATE OF CONFORMANCE"),
-        (r"Z_NPE_CERT OF COMPLIANCE|^\s*CERTIFICATE OF COMPLIANCE\s*$", "CERTIFICATE OF COMPLIANCE"),
-        (r"Z_NPE_CERT OF CONFORMITY|^\s*CERTIFICATE OF CONFORMITY\s*$", "CERTIFICATE OF CONFORMITY"),
-        (r"Z_NPE_CODE CMTR|CODE CERTIFIED MATERIAL TEST REPORT", "CERTIFIED MATERIAL TEST REPORT (CMTR)"),
-        (r"Z_NPE_CMTR|MATERIAL TEST REPORT \(MTR\) REQUIREMENTS", "MATERIAL TEST REPORT (MTR)"),
-        (r"Z_NPE_CODE DATA REPORT|^\s*CODE DATA REPORT\s*$", "CODE DATA REPORT"),
-        (r"Z_NPE_CODE RECONCILIATION|CODE RECONCILIATION REQUIREMENTS", "CODE RECONCILIATION (IF REQUIRED)"),
-        (r"CALIBRATION CERTIFICATE|CERTIFICATE OF CALIBRATION", "CALIBRATION CERTIFICATE"),
-        (r"MATERIAL TEST CERTIFICATE|\bMTC\b", "MATERIAL TEST CERTIFICATE"),
-        (r"\bTEST CERTIFICATE\b", "TEST CERTIFICATE"),
-    ]
-    certificates = [label for pattern, label in definitions if re.search(pattern, quality, re.I | re.M)]
-    nuclear_safety = bool(re.search(r"Z_NPE_QA\s+SR\s+MATERIAL|\bNUCLEAR SAFETY RELATED\b", quality, re.I))
-    packing_slip = bool(re.search(r"Packing Slip or Equivalent Commercial Certification is required", quality, re.I))
-    clauses = []
-    if nuclear_safety:
-        clauses.append("NUCLEAR SAFETY-RELATED MATERIAL: NAWAH-approved nuclear QA requirements apply; review full source requirements.")
-    if packing_slip:
-        clauses.append("PACKING SLIP OR EQUIVALENT COMMERCIAL CERTIFICATION REQUIRED.")
-    clauses.extend(dict.fromkeys(certificates))
-    result = "Material PO Text:\n\n" + material if material else "Material PO Text:"
-    if clauses:
-        result += "\n\nQUALITY REQUIREMENTS\n\n" + "\n".join(clauses)
-    return remove_separator_lines(normalize_pdf_symbols(result)), extract_manufacturers(material)
 
 
 def _nawah_excel_records(book, rfq_number):
@@ -672,6 +667,8 @@ def parse_nawah_rfq_pdf(pdf_file):
         for raw_line in page.splitlines():
             line = raw_line.rstrip()
             found = head.fullmatch(line)
+            if found is None and re.match(r"^\s*\d{1,5}\s+\d{7,12}\s+", line):
+                raise ValueError(f"Nawah item row could not be parsed: {line.strip()!r}. No partial import was produced.")
             if found:
                 item_no, material, description, mpn, quantity, uom, delivery = found.groups()
                 current = {"RFx Number":rfq_number, "RFx Item No":str(int(item_no)),
@@ -772,7 +769,7 @@ def parse_tabular_rfq_pdf(pdf_file):
             bottom = page.rect.height - 30
             row_heads = sorted([(w[1], int(str(w[4]))) for w in words
                                 if text_top <= w[1] < bottom and 0 <= w[0] < 35
-                                and re.fullmatch(r"\d{1,3}", str(w[4]))], key=lambda x: x[0])
+                                and re.fullmatch(r"\d{1,5}", str(w[4]))], key=lambda x: x[0])
             # A partial row may occupy the top of a new page BEFORE a new item.
             first_y = row_heads[0][0] if row_heads else bottom
             continuation = physical_lines(column_words(words, 190, 400, text_top, first_y - 1))
@@ -789,10 +786,10 @@ def parse_tabular_rfq_pdf(pdf_file):
                 uom = " ".join(w[4] for w in column_words(row_words, 445, 490, top_y - 2, lower_y)).strip()
                 description_lines = physical_lines(column_words(row_words, 190, 400, top_y - 2, lower_y))
                 if not description_lines:
-                    continue
+                    raise ValueError(f"Fertil item {sequence}: description is missing; no partial import was produced.")
                 if not (re.fullmatch(r"\d{4,6}", pr_item) and re.fullmatch(r"\d{6,}", material)
                         and re.fullmatch(r"[\d,.]+", qty) and re.fullmatch(r"[A-Za-z]{1,8}", uom)):
-                    continue
+                    raise ValueError(f"Fertil item {sequence}: invalid item fields (PR={pr_item!r}, material={material!r}, quantity={qty!r}, UOM={uom!r}); no partial import was produced.")
                 all_items.append({"RFx Number": rfq_number, "RFx Item No": str(int(pr_item)),
                                   "PR Item No": pr_item, "Material No": material,
                                   "Description": description_lines[0],
@@ -800,6 +797,8 @@ def parse_tabular_rfq_pdf(pdf_file):
                                   "QTY": qty, "UOM": uom})
     finally:
         doc.close()
+    if layout_seen and not all_items:
+        raise ValueError("Fertil table detected but no complete items could be imported.")
     return all_items if all_items else None
 
 def resolve_template(uploaded, default_filename):
@@ -1047,28 +1046,36 @@ VALIDATION_LABELS = re.compile(
     r"FLOW(?: RATING)?|CAPACITY|ACCURACY|RATED VOLTAGE)\s*:\s*(.+)$", re.I)
 VALIDATION_EMPTY = {"", "-", "--", "---", "N/A", "NONE", "NULL"}
 CRITICAL_FIELD = re.compile(r"MFR|MANUFACTURER|PART|MPN|OEM|MODEL|DRAWING|TAG", re.I)
-NUMBER_TOKEN = re.compile(r"(?<![A-Za-z])(?:\d+(?:[.,]\d+)*(?:/\d+)?)(?:\s*(?:MM|CM|IN|INCH|BAR|PSI|VAC|VDC|V|HZ|RPM|DEG|°C|°F|KG|LPM))?", re.I)
+NUMBER_TOKEN = re.compile(r"(?<![\w.+/\-])[+-]?(?:\d+(?:[.,]\d+)*(?:/\d+)?)(?:\s*(?:MM|CM|INCH|IN|BAR|PSI|VAC|VDC|V|HZ|RPM|DEG|°C|°F|KG|LPM))?", re.I)
 
 def compare_normalize(value):
     value = normalize_pdf_symbols(str(value)).casefold()
-    return re.sub(r"[^a-z0-9]+", "", value)
+    # Ignore presentation whitespace only. Identifier and numeric punctuation
+    # (including signs, decimals and fractions) carries technical meaning.
+    return re.sub(r"\s+", "", value)
 
 def _multiset_contains(original, formatted):
-    return compare_normalize(original) in compare_normalize(formatted)
+    expected = compare_normalize(original)
+    if not expected:
+        return False
+    # Keep token boundaries from the source text: removing whitespace before
+    # matching would both merge adjacent words and permit numeric substrings.
+    chars = [re.escape(char) for char in expected]
+    pattern = r"(?<![\w.+/\-])" + r"\s*".join(chars) + r"(?![\w.+/\-])"
+    return re.search(pattern, normalize_pdf_symbols(str(formatted)).casefold()) is not None
 
 def validate_rfq(source, draft, format_style="default", description=""):
     """Check labeled technical fields, numbers and certificate deliverables.
 
-    Do not flag omitted source sections for Nawah that are intentionally
-    summarized. The warnings are review aids, never claims of full compliance.
+    Include Nawah quality obligations in the checks. The warnings are review
+    aids, never claims of full compliance.
     """
     source = str(source or "")
     draft = str(draft or "")
     if format_style == "tabular_pdf" and description:
         draft = description + "\n" + draft
     src = source.splitlines()
-    cut = next((i for i, line in enumerate(src) if re.search(r"^\s*(?:QUALITY REQUIREMENTS?\s*:?|START OF MESSAGE CODE)", line, re.I)), len(src)) if format_style.startswith("nawah") else len(src)
-    check_lines = src[:cut]
+    check_lines = src
     warnings = []
     seen = set()
     for line in check_lines:
@@ -1088,11 +1095,9 @@ def validate_rfq(source, draft, format_style="default", description=""):
                                  "message":"Technical value not found in formatted text"})
                 seen.add(signature)
     # For complex narrative, compare digit-bearing identifiers outside recognized
-    # fields. Ignore boilerplate separators and skip this check in Nawah source QA.
+    # fields, including values in Nawah source quality requirements.
     number_source = "\n".join(line for line in check_lines if not VALIDATION_LABELS.match(line.strip()))
     for token in NUMBER_TOKEN.findall(number_source):
-        if len(compare_normalize(token)) < 3:
-            continue
         if not _multiset_contains(token, draft) and len(warnings) < 35:
             key = ("numeric",compare_normalize(token))
             if key not in seen:
@@ -1100,20 +1105,16 @@ def validate_rfq(source, draft, format_style="default", description=""):
                                  "message":"Number or unit may be missing or changed"})
                 seen.add(key)
     if format_style.startswith("nawah"):
-        # Explicit certificate requirements must survive the shortened QA section.
-        requirements = [
-            (r"Z_NPE_CERT OF CONFORMANCE", "CERTIFICATE OF CONFORMANCE"),
-            (r"Z_NPE_CERT OF COMPLIANCE", "CERTIFICATE OF COMPLIANCE"),
-            (r"Z_NPE_CERT OF CONFORMITY", "CERTIFICATE OF CONFORMITY"),
-            (r"Z_NPE_CODE CMTR", "CERTIFIED MATERIAL TEST REPORT"),
-            (r"Z_NPE_CMTR", "MATERIAL TEST REPORT"),
-            (r"Z_NPE_CODE DATA REPORT", "CODE DATA REPORT"),
-            (r"Z_NPE_CODE RECONCILIATION", "CODE RECONCILIATION"),
-        ]
-        for pattern, name in requirements:
-            if re.search(pattern, source, re.I) and name.casefold() not in draft.casefold():
-                warnings.append({"priority":"Critical", "field":"Quality requirement", "value":name,
-                                 "message":"Required documentation may be missing"})
+        in_quality = False
+        for line in src:
+            if re.match(r"^\s*(?:QUALITY REQUIREMENTS?\s*:?|START OF MESSAGE CODE\b)", line, re.I):
+                in_quality = True
+            if (in_quality and line.strip()
+                    and not re.fullmatch(r"[\s\-*=._#~]+", line)
+                    and not _multiset_contains(line, draft)):
+                warnings.append({"priority": "Critical", "field": "Quality requirement",
+                                 "value": line.strip(),
+                                 "message": "Source quality requirement is missing or changed"})
     return warnings
 
 
@@ -1122,8 +1123,6 @@ def _classification(line, draft, format_style):
     if not val:
         return "normal"
     if re.fullmatch(r"[-*=_#. ~]{4,}", val):
-        return "excluded"
-    if format_style.startswith("nawah") and re.search(r"COMMERCIAL QA|AUGMENTED QUALITY|GENERAL PACKAGING|START OF MESSAGE CODE|END OF MESSAGE CODE", val, re.I):
         return "excluded"
     # Empty placeholders are intentionally removed, but --- markers should
     # be RED in the source so reviewers can verify their removal explicitly.
@@ -1144,10 +1143,7 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
     # A source line occurring twice must also occur twice in the draft.
     # Otherwise, highlight the missing occurrence even when the first matches.
     available_counts = Counter(compare_normalize(line) for line in plain_review_text(formatted).splitlines() if line.strip())
-    in_quality = False
     for line in original_lines:
-        if style.startswith("nawah") and re.match(r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
-            in_quality = True
         cls = _classification(line, formatted, style)
         key = compare_normalize(line)
         if cls == "matched" and key:
@@ -1155,8 +1151,6 @@ def comparison_html(original, formatted, style="default", sync=True, height=510)
                 available_counts[key] -= 1
             else:
                 cls = "missing"
-        if in_quality and style.startswith("nawah") and cls == "missing":
-            cls = "excluded"  # Nawah quality boilerplate is summarized intentionally.
         stats[cls] += 1
         rendered.append('<span class="' + cls + '">' + html.escape(line) + '</span>')
     left = "\n".join(rendered)
@@ -1281,23 +1275,33 @@ def _save_current(review, prefix):
 def _navigate_review(review, prefix, new_position):
     if not _save_current(review, prefix):
         return
+    review["queue"][review["position"]]["editing"] = False
     review["position"] = new_position
+    review["queue"][new_position]["editing"] = False
     st.rerun(scope="fragment")
 
 
 def space_after_initial_section_header(text):
-    """Use one blank line after an initial PO/Basic/Classification/MPN/Inspection header.
+    """Space the initial section header and every MPN heading in the draft.
 
     Only the generated Working Sheet draft is changed. Original RFQ and
     Uploading Sheet text remain untouched.
     """
     text = str(text or "")
-    return re.sub(
+    text = re.sub(
         r"\A(\s*(?:(?:Basic Data|Classification|MPN|Inspection|Material PO|PO Material|Purchase Order)\s+Text)\s*:)\s*\n+",
         lambda m: m.group(1) + "\n\n",
         text,
         count=1,
         flags=re.I,
+    )
+    # PDF-specific formatters can preserve MPN sections below other content.
+    # Apply this shared rule anywhere in the draft, not only at its start.
+    return re.sub(
+        r"^([ \t]*(?:\*\*)?MPN[ \t]+(?:Text|Details)[ \t]*:?[ \t]*(?:\*\*)?[ \t]*)\n(?:[ \t]*\n)*",
+        lambda m: m.group(1) + "\n\n",
+        text,
+        flags=re.I | re.M,
     )
 
 
@@ -1430,18 +1434,21 @@ def make_rich_text_shared_strings(data, items=None):
     indices = {}
     for idx, item in enumerate(items):
         plain = plain_review_text(item["formatted"])
+        checked_excel_value(plain, f"Working Sheet item {item['line']}")
         runs = working_sheet_runs(item["formatted"])
         # XlsxWriter requires at least two fragments for write_rich_string.
         if len(runs) >= 2:
             parts = []
             for value, bold in runs:
                 parts.extend((bold_font if bold else base_font, value))
-            temp_sheet.write_rich_string(idx, 0, *parts)
+            status = temp_sheet.write_rich_string(idx, 0, *parts)
         elif len(runs) == 1:
             value, bold = runs[0]
-            temp_sheet.write_string(idx, 0, value, bold_font if bold else base_font)
+            status = temp_sheet.write_string(idx, 0, value, bold_font if bold else base_font)
         else:
-            temp_sheet.write_string(idx, 0, plain, base_font)
+            status = temp_sheet.write_string(idx, 0, plain, base_font)
+        if status != 0:
+            raise ValueError(f"Working Sheet item {item['line']}: rich text export failed (code {status}).")
     scratch_book.close()
     with zipfile.ZipFile(BytesIO(scratch.getvalue())) as temp:
         generated_sst = etree.fromstring(temp.read("xl/sharedStrings.xml"))
@@ -1535,7 +1542,7 @@ def finalize_verified(session_prefix):
             "A": item["line"], "B": item["desc"], "C": item["qty"],
             "D": item["uom"], "E": plain_review_text(item["formatted"]),
         }.items():
-            sheet[f"{col}{i}"] = value
+            sheet[f"{col}{i}"] = checked_excel_value(value, f"Working Sheet {col}{i}")
         sheet[f"A{i}"].fill = copy(line_fill)
     # Keep the blue Line item number column continuous below the last item.
     # Replacement templates sometimes have unstyled blank rows between the
@@ -1557,7 +1564,19 @@ def finalize_verified(session_prefix):
     # Reopen the exact generated file to catch malformed OOXML before delivery.
     try:
         reopened = load_workbook(BytesIO(output_bytes), read_only=False, rich_text=True)
-        reopened.close()
+        try:
+            for row_number, item in enumerate(queue, 2):
+                expected = {"A": item["line"], "B": item["desc"], "C": item["qty"],
+                            "D": item["uom"], "E": plain_review_text(item["formatted"])}
+                for column, value in expected.items():
+                    actual = reopened.active[f"{column}{row_number}"].value
+                    if value in (None, "") and actual is None:
+                        continue
+                    matches = str(actual) == value if isinstance(value, str) else actual == value
+                    if not matches:
+                        raise ValueError(f"Export changed item {item['line']}, column {column}")
+        finally:
+            reopened.close()
     except Exception as exc:
         raise ValueError(f"Working Sheet failed XLSX validation: {exc}") from exc
     st.session_state[f"{session_prefix}_final_bytes"] = output_bytes
@@ -1594,12 +1613,8 @@ def _review_panel(body, *, empty_label="(No text)", panel_height=None):
 def colored_reference(original, formatted, panel_height=None, format_style="default"):
     """Use the same source-line classification as non-editing preview."""
     highlighted_lines = []
-    in_quality = False
     available_counts = Counter(compare_normalize(line) for line in plain_review_text(formatted).splitlines() if line.strip())
     for line in original.splitlines():
-        if format_style.startswith("nawah") and re.match(
-                r"^\s*QUALITY REQUIREMENTS?\s*:?\s*$", line, re.I):
-            in_quality = True
         cls = _classification(line, formatted, format_style)
         key = compare_normalize(line)
         if cls == "matched" and key:
@@ -1607,8 +1622,6 @@ def colored_reference(original, formatted, panel_height=None, format_style="defa
                 available_counts[key] -= 1
             else:
                 cls = "missing"
-        if in_quality and format_style.startswith("nawah") and cls == "missing":
-            cls = "excluded"
         style = {
             "missing": "color:#bd1e32;font-weight:600",
             "excluded": "color:#0868a8",
@@ -1794,7 +1807,7 @@ def review_popup(session_prefix):
                         REVIEW_PANEL_HEIGHT + (65 if item.get("tabular_pdf") else 0))
     if issues:
         with st.expander(f"Quality checks · {len(issues)} potential discrepancies", expanded=bool(critical)):
-            st.caption("These are rule-based alerts, not confirmed errors. Source exceptions and shortened certificate summaries can trigger false positives.")
+            st.caption("These are rule-based alerts, not confirmed errors. Check potential discrepancies against the source requirements.")
             for issue in issues[:20]:
                 mark = "🔴" if issue["priority"] == "Critical" else "🟠"
                 st.markdown(f"{mark} **{html.escape(issue['field'])}** — `{html.escape(issue['value'])}` · {issue['message']}")
@@ -1982,7 +1995,7 @@ with col1:
                                   "F": rec["PO Text"], "G": normalize_qty(rec["QTY"]),
                                   "H": rec["UOM"], "I": ""}
                         for column, value in values.items():
-                            upload_sheet[f"{column}{row_index}"] = value
+                            upload_sheet[f"{column}{row_index}"] = checked_excel_value(value, f"Uploading Sheet {column}{row_index}")
                         records.append((rec["RFx Item No"], rec["Description"],
                                         rec["QTY"], rec["UOM"], rec["PO Text"]))
                     selected_style = "dubai_csv"
@@ -2009,7 +2022,7 @@ with col1:
                             for col, val in {"A":rec['RFx Number'], "B":rec['RFx Item No'], "C":rec['PR Item No'],
                                              "D":rec['Material No'], "E":rec['Description'], "F":rec['PO Text'],
                                              "G":normalize_qty(rec['QTY']), "H":rec['UOM'], "I":rec.get('ARIBA Number', '')}.items():
-                                upload_sheet[f"{col}{i}"] = val
+                                upload_sheet[f"{col}{i}"] = checked_excel_value(val, f"Uploading Sheet {col}{i}")
                             records.append((rec['RFx Item No'],rec['Description'],rec['QTY'],rec['UOM'],rec['PO Text']))
                     else:
                         df = pd.read_excel(book, sheet_name=matching, keep_default_na=False)
@@ -2030,7 +2043,7 @@ with col1:
                                       "F":rec["InternalNote"], "G":normalize_qty(rec["Quantity"]),
                                       "H":rec["Unit of Measure"], "I":rec.get("Number", "")}
                             for c, value in values.items():
-                                upload_sheet[f"{c}{row}"] = value
+                                upload_sheet[f"{c}{row}"] = checked_excel_value(value, f"Uploading Sheet {c}{row}")
                             records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
                     selected_style = "nawah_excel" if is_nawah_excel else "default"
                 wrap_all(upload_sheet)
@@ -2082,7 +2095,8 @@ with col2:
                            ("QTY", "G"), ("UOM", "H")]
                 for i, item in enumerate(data, start=2):
                     for field, col in mapping:
-                        sheet[f"{col}{i}"] = normalize_qty(item[field]) if field == "QTY" else item[field]
+                        value = normalize_qty(item[field]) if field == "QTY" else item[field]
+                        sheet[f"{col}{i}"] = checked_excel_value(value, f"Uploading Sheet {col}{i}")
                     records.append((item["RFx Item No"], item["Description"], item["QTY"], item["UOM"], item["PO Text"]))
                 wrap_all(sheet)
                 prepare_review(records, resolve_template(pdf_final_tpl, "Working Sheet.xlsx"), hts_number.strip(), "pdf", upload_wb,
