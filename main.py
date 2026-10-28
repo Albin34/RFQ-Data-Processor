@@ -491,6 +491,9 @@ def parse_pdf(body, full_rfq_text):
 # unfamiliar codes are carried verbatim into the Working Sheet for review.
 _NAWAH_EXCLUDE_CODES = {
     "COMMERCIAL QA", "PC3 MATERIAL", "GENERAL PACKAGING",
+    # This is an internal Nawah procurement-at-risk/receipt hold notice,
+    # not a supplier-facing technical or certification requirement.
+    "RISK",
 }
 _NAWAH_CERT_CODES = (
     (r"^CERT OF CONFORMANCE$", "CERTIFICATE OF CONFORMANCE"),
