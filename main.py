@@ -595,6 +595,26 @@ def _summarize_nawah_quality(quality):
         short_code = re.sub(r"^Z_NPE_", "", code, flags=re.I).strip().upper()
         if short_code in _NAWAH_EXCLUDE_CODES:
             continue
+        if short_code == "CALIBRATION":
+            # Unlike a simple calibration-certificate request, Z_NPE_CALIBRATION
+            # prescribes calibration methods, traceability, TAR and the report
+            # contents. Preserve ALL instructions, matching the approved Nawah
+            # Working Sheet; strip only message-code wrappers/dividers.
+            substantive = []
+            for source_line in block.splitlines():
+                if (_NAWAH_START.match(source_line) or _NAWAH_END.match(source_line)
+                        or re.fullmatch(r"\s*[*=_-]{4,}\s*", source_line)):
+                    continue
+                substantive.append(source_line.rstrip())
+            calibration = "\n".join(substantive).strip()
+            # Preserve section and list separation, but not stacks of blank
+            # lines left by the removed message wrappers and divider lines.
+            calibration = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", calibration)
+            if calibration:
+                # An individual PDF extraction may leave a terminal full stop
+                # outside the message block. It is not a requirement.
+                unknown.append(calibration)
+            continue
         if short_code == "QA SR MATERIAL":
             clauses.append("NUCLEAR SAFETY-RELATED MATERIAL: NAWAH-approved nuclear QA requirements apply; review full source requirements.")
             continue
@@ -639,7 +659,9 @@ def summarize_nawah_working_note(raw):
     result = "Material PO Text:\n\n" + material if material else "Material PO Text:"
     if quality_note:
         result += "\n\nQUALITY REQUIREMENTS\n\n" + quality_note
-    return remove_separator_lines(normalize_pdf_symbols(result)), extract_manufacturers(material)
+    result = remove_separator_lines(normalize_pdf_symbols(result))
+    result = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", result)
+    return result, extract_manufacturers(material)
 
 
 def _nawah_excel_records(book, rfq_number):
