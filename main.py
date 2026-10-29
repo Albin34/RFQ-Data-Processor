@@ -96,6 +96,30 @@ st.markdown("""<style>
 [data-testid="stFileUploader"] {border-radius:12px}
 [data-testid="stMetric"] {background:#192436;border:1px solid #344158;border-radius:10px;padding:8px 12px}
 
+/* Compact no-format confirmation: override global full-width dialog rules. */
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-noformat-modal) {
+  width:min(430px, calc(100vw - 32px))!important;
+  max-width:min(430px, calc(100vw - 32px))!important;
+  min-width:0!important;
+  height:auto!important;
+}
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-noformat-modal) [data-testid="stAlert"] {
+  width:100%!important;
+  min-width:0!important;
+  max-width:100%!important;
+  overflow-wrap:anywhere!important;
+  box-sizing:border-box!important;
+}
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-noformat-modal) [data-testid="stHorizontalBlock"] {
+  justify-content:center!important;
+  gap:12px!important;
+}
+[data-testid="stDialog"] [role="dialog"]:has(#rfq-noformat-modal) [data-testid="column"] {
+  min-width:0!important;
+  flex:0 1 150px!important;
+  width:150px!important;
+}
+
 /* Only the Verify All dialog should be compact; not the main review dialog. */
 [data-testid="stDialog"] [role="dialog"]:has(#rfq-confirm-modal) {
   width:min(490px, calc(100vw - 32px))!important;
@@ -2087,7 +2111,9 @@ def download_xlsx(label, data, filename, key):
 
 @st.dialog("Confirm No-Formatting Export", width="small")
 def confirm_excel_no_format():
-    st.warning("The Internal Note will be copied exactly from the source PO Text. No formatting or RFQ Quality Review will be performed. Continue at your own risk.")
+    st.markdown('<span id="rfq-noformat-modal"></span>', unsafe_allow_html=True)
+    st.warning("Copy PO Text unchanged and skip quality review?")
+    st.caption("Review the exported Working Sheet before use.")
     yes, no = st.columns(2)
     with yes:
         if st.button("Continue", type="primary", key="noformat_continue", use_container_width=True):
