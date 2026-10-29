@@ -189,7 +189,7 @@ SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = set()
 FOLLOWED_BY_DATA_LABELS = {"tag nos", "tag numbers", "mpn details"}
-PRESERVED_LABELS = {"characteristics"}
+PRESERVED_LABELS = {"characteristics", "cell/battery measurement", "battery stand measurement"}
 # Narrative subsection titles must not be mistaken for blank attribute fields.
 NARRATIVE_HEADING_PATTERN = re.compile(
     r"\b(?:requirements?|instructions?|conditions?|notes?|remarks?|scope|deliverables?|documentation)\b",
@@ -305,6 +305,9 @@ def format_rfq_python(text):
     verify every line. Unrecognized content is included instead of discarded.
     """
     raw = _clean(text).replace("\r\n", "\n").replace("\r", "\n")
+    # Corrupted Ariba carrier heading (not a technical specification).
+    # Only remove the malformed heading itself; retain the following data.
+    raw = re.sub(r"(?im)^\s*;\s*Material\s+PO\s+text\s*:\s*(?=\n|$)", "", raw)
     raw = expand_inline_rfq_fields(raw)
     if not raw:
         return "", ""
@@ -1428,7 +1431,7 @@ def space_after_initial_section_header(text):
     )
 
 
-def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default"):
+def prepare_review(records, template, suffix, session_prefix, upload_wb=None, format_style="default", no_format=False):
     """Pre-format all rows instantly, queue for mandatory per-row verification."""
     if not records:
         raise ValueError("No RFQ items to process")
@@ -1437,7 +1440,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
     template_data = workbook_bytes(template_wb)
     queue = []
     for line, desc, qty, uom, note in records:
-        formatted, manufacturer = (format_dubai_petroleum_note(note)
+        formatted, manufacturer = ((str(note) if note is not None else ""), "") if no_format else (format_dubai_petroleum_note(note)
                                    if format_style == "dubai_csv"
                                    else format_tabular_pdf_note(note)
                                    if format_style == "tabular_pdf"
@@ -1445,10 +1448,11 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
                                    else process_rfq_text(note))
         # Formatting-only normalization across all RFQ formats. The original
         # source and Uploading Sheet PO Text are deliberately not altered.
-        formatted = normalize_technical_punctuation(formatted)
-        formatted = space_after_initial_section_header(formatted)
+        if not no_format:
+            formatted = normalize_technical_punctuation(formatted)
+            formatted = space_after_initial_section_header(formatted)
         is_table = format_style == "tabular_pdf"
-        if is_table:
+        if is_table and not no_format:
             desc_clean = str(desc).strip()
             lines = formatted.splitlines()
             if lines and lines[0].strip().casefold() == desc_clean.casefold():
@@ -1472,6 +1476,7 @@ def prepare_review(records, template, suffix, session_prefix, upload_wb=None, fo
             "default":"Standard Ariba / ADNOC"}.get(format_style,format_style),
         "template": template_data,
         "upload_bytes": workbook_bytes(upload_wb) if upload_wb is not None else None,
+        "no_format": no_format,
     }
     # Uploading Sheet has no AI formatting and can be downloaded immediately.
     st.session_state.pop(f"{session_prefix}_final_bytes", None)
@@ -1660,7 +1665,7 @@ def finalize_verified(session_prefix):
     for i, item in enumerate(queue, 2):
         for col, value in {
             "A": item["line"], "B": item["desc"], "C": item["qty"],
-            "D": item["uom"], "E": plain_review_text(item["formatted"]),
+            "D": item["uom"], "E": (item["formatted"] if review.get("no_format") else plain_review_text(item["formatted"])),
         }.items():
             sheet[f"{col}{i}"] = value
         sheet[f"A{i}"].fill = copy(line_fill)
@@ -1680,7 +1685,8 @@ def finalize_verified(session_prefix):
         if other is not sheet:
             wb.remove(other)
     wrap_all(sheet)
-    output_bytes = make_rich_text_shared_strings(workbook_bytes(wb), queue)
+    output_bytes = (workbook_bytes(wb) if review.get("no_format")
+                    else make_rich_text_shared_strings(workbook_bytes(wb), queue))
     # Reopen the exact generated file to catch malformed OOXML before delivery.
     try:
         reopened = load_workbook(BytesIO(output_bytes), read_only=False, rich_text=True)
@@ -2079,6 +2085,18 @@ def download_xlsx(label, data, filename, key):
     st.download_button(label, data, file_name=filename,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
+@st.dialog("Confirm No-Formatting Export", width="small")
+def confirm_excel_no_format():
+    st.warning("The Internal Note will be copied exactly from the source PO Text. No formatting or RFQ Quality Review will be performed. Continue at your own risk.")
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("Continue", type="primary", key="noformat_continue", use_container_width=True):
+            st.session_state["excel_noformat_confirmed"] = True
+            st.rerun()
+    with no:
+        if st.button("Cancel", key="noformat_cancel", use_container_width=True):
+            st.rerun()
+
 st.caption("Processing engine: Python rules only | AI/API: Disabled | Every Working Sheet line requires approval")
 
 col1, col2 = st.columns([1, 1], gap="medium")
@@ -2090,7 +2108,18 @@ with col1:
         upload_tpl = st.file_uploader("Upload template (.xlsx)", type=["xlsx"], key="tpl_upl")
         final_tpl = st.file_uploader("Final Sheet template (.xlsx)", type=["xlsx"], key="tpl_fin")
     suffix = st.text_input("Output name suffix", key="suffix_excel")
-    if st.button("Process Excel", key="btn_excel"):
+    regular_excel_col, raw_excel_col = st.columns(2)
+    with regular_excel_col:
+        process_excel_clicked = st.button("Process Excel", key="btn_excel", use_container_width=True)
+    with raw_excel_col:
+        no_format_clicked = st.button("Process Excel (No Formatting)", key="btn_excel_raw", use_container_width=True)
+    if no_format_clicked:
+        if techno is None or not suffix.strip():
+            st.warning("Upload an RFQ file and enter an output name suffix first.")
+        else:
+            confirm_excel_no_format()
+    no_format_export = st.session_state.pop("excel_noformat_confirmed", False)
+    if process_excel_clicked or no_format_export:
         if techno is None or not suffix.strip():
             st.warning("Upload the Techno-Commercial Envelope and enter an output suffix.")
         else:
@@ -2161,9 +2190,16 @@ with col1:
                             records.append((line, rec["Description"], rec["Quantity"], rec["Unit of Measure"], rec["InternalNote"]))
                     selected_style = "nawah_excel" if is_nawah_excel else "default"
                 wrap_all(upload_sheet)
-                prepare_review(records, resolve_template(final_tpl, "Working Sheet.xlsx"), suffix.strip(), "excel", upload_wb, format_style=selected_style)
-                st.success("Excel RFQ prepared for verification")
-                review_popup("excel")
+                prepare_review(records, resolve_template(final_tpl, "Working Sheet.xlsx"), suffix.strip(), "excel", upload_wb, format_style=selected_style, no_format=no_format_export)
+                if no_format_export:
+                    for item in st.session_state["excel_review"]["queue"]:
+                        item["verified"] = True
+                    st.session_state["excel_review"]["verification_skipped"] = True
+                    finalize_verified("excel")
+                    st.success("Excel files generated without formatting or line-by-line review. Please check the Working Sheet before use.")
+                else:
+                    st.success("Excel RFQ prepared for verification")
+                    review_popup("excel")
             except Exception as exc:
                 show_error("Excel processing failed (no incomplete files were saved)", exc)
     review_status("excel")
