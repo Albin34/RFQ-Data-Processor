@@ -214,33 +214,49 @@ EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = set()
 FOLLOWED_BY_DATA_LABELS = {"tag nos", "tag numbers", "mpn details"}
 PRESERVED_LABELS = {"characteristics", "cell/battery measurement", "battery stand measurement"}
+# Only these specific blank MPN metadata fields are removed without an explicit
+# placeholder. Other bare headings (e.g. DIMENSION:) may introduce next-line data.
+EMPTY_MPN_LABELS = {
+    "oem part number", "oem model number", "oem serial number",
+    "drawing number", "position number", "tag number", "assembly number",
+}
 # Narrative subsection titles must not be mistaken for blank attribute fields.
 NARRATIVE_HEADING_PATTERN = re.compile(
     r"\b(?:requirements?|instructions?|conditions?|notes?|remarks?|scope|deliverables?|documentation)\b",
     re.I,
 )
+_MALFORMED_ASSEMBLY = re.compile(
+    r"^assembly\s+number\s*:\s*(?:(?:assembly|sembly|embly)\s+number\s*:|:)\s*$",
+    re.I,
+)
 
 
 def is_empty_field(line, next_nonempty=""):
-    """Drop only genuinely empty attribute fields; preserve prose and technical values."""
+    """Remove explicit placeholders and known empty MPN fields, not headings.
+
+    A bare DIMENSION: / CELL/BATTERY MEASUREMENT: can introduce values below.
+    A field with a literal '-', '--', or '---' is an empty placeholder.
+    """
     line = line.strip()
     if not line:
         return True
     if line.casefold() in META_LINES:
         return True
-    # Section subheadings can introduce values on subsequent lines.
-    # Keep them only when meaningful following content exists.
-    normalized_heading = line.rstrip(": \t").strip().casefold()
-    if normalized_heading in FOLLOWED_BY_DATA_LABELS and next_nonempty and not match_section(next_nonempty):
+    if _MALFORMED_ASSEMBLY.fullmatch(line):
+        return True
+    if ":" not in line:
         return False
-    if ":" in line:
-        left, right = line.split(":", 1)
-        # Empty field label, including extraction placeholders.
-        label = left.strip()
-        if label.casefold() in PRESERVED_LABELS or NARRATIVE_HEADING_PATTERN.search(label):
-            return False
-        if label and right.strip().casefold() in EMPTY_MARKERS:
-            return True
+    left, right = line.split(":", 1)
+    label = left.strip().casefold()
+    value = right.strip().casefold()
+    if not label:
+        return False
+    if value in {"-", "--", "---", "n/a", "na", "nil", "none", "null"}:
+        return True
+    # Leave headings without values (including DIMENSION:) alone, except
+    # specifically defined metadata placeholders.
+    if not value and label in EMPTY_MPN_LABELS:
+        return True
     return False
 
 
@@ -1305,7 +1321,7 @@ def _classification(line, draft, format_style):
     # be RED in the source so reviewers can verify their removal explicitly.
     if re.match(r"^[\w /().-]+\s*:\s*-{3,}\s*$", val, re.I):
         return "missing"
-    if re.match(r"^[\w /().-]+\s*:\s*(?:-+|N/?A)?$", val, re.I) and val.casefold() not in {"characteristics :", "mpn details"}:
+    if is_empty_field(val):
         return "excluded"
     if _multiset_contains(val, plain_review_text(draft)):
         return "matched"
