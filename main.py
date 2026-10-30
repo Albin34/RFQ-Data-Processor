@@ -207,9 +207,10 @@ SECTION_PATTERNS = {
     "Classification Text": re.compile(r"^classification\s+text\s*:?\s*$", re.I),
     "MPN Text": re.compile(r"^mpn\s+text\s*:?\s*$", re.I),
     "Inspection Text": re.compile(r"^inspection\s+text\s*:?\s*$", re.I),
-    "PO Material Text": re.compile(r"^(?:po\s+material|purchase\s+order)\s+text\s*:?\s*$", re.I),
+    "Purchase Order Text": re.compile(r"^purchase\s+order\s+text\s*:?\s*$", re.I),
+    "PO Material Text": re.compile(r"^(?:po\s+material|material\s+po)\s+text\s*:?\s*$", re.I),
 }
-SECTION_ORDER = ("PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
+SECTION_ORDER = ("Purchase Order Text", "PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = set()
 FOLLOWED_BY_DATA_LABELS = {"tag nos", "tag numbers", "mpn details"}
@@ -225,10 +226,39 @@ NARRATIVE_HEADING_PATTERN = re.compile(
     r"\b(?:requirements?|instructions?|conditions?|notes?|remarks?|scope|deliverables?|documentation)\b",
     re.I,
 )
+# Malformed extraction fragments of empty Assembly Number metadata.  Match
+# repeated/truncated suffixes of the same label, never meaningful values.
 _MALFORMED_ASSEMBLY = re.compile(
-    r"^assembly\s+number\s*:\s*(?:(?:assembly|sembly|embly)\s+number\s*:|:)\s*$",
+    r"^assembly\s*number\s*:\s*(?:(?:(?:assembly|sembly|embly|mbly|ly|y|umber|mber|ber|er|r|ag|tag)\s+)?number\s*:|(?:assembly|sembly|embly|mbly|ly|y|umber|mber|ber|er|r)\s*:|:)\s*$",
     re.I,
 )
+
+_COMPACT_MPN_LABELS = re.compile(
+    r"^(?P<label>Manufacturer\s*Part\s*Number|Manufacturer\s*number|"
+    r"OEM\s*Part\s*Number|OEM\s*Model\s*Number|OEM\s*Serial\s*Number|"
+    r"Drawing\s*Number|Position\s*Number|Tag\s*Number|Assembly\s*Number)\s*:",
+    re.I,
+)
+
+
+def normalize_mpn_label(line):
+    """Canonicalize compact MPN labels while preserving original field values."""
+    match = _COMPACT_MPN_LABELS.match(line)
+    if not match:
+        return line
+    key = re.sub(r"\s+", "", match.group("label")).casefold()
+    standard = {
+        "manufacturerpartnumber": "Manufacturer Part Number",
+        "manufacturernumber": "Manufacturer number",
+        "oempartnumber": "OEM Part Number",
+        "oemmodelnumber": "OEM Model Number",
+        "oemserialnumber": "OEM Serial Number",
+        "drawingnumber": "Drawing Number",
+        "positionnumber": "Position Number",
+        "tagnumber": "Tag Number",
+        "assemblynumber": "Assembly Number",
+    }[key]
+    return standard + ":" + line[match.end():]
 
 
 def is_empty_field(line, next_nonempty=""):
@@ -247,7 +277,7 @@ def is_empty_field(line, next_nonempty=""):
     if ":" not in line:
         return False
     left, right = line.split(":", 1)
-    label = left.strip().casefold()
+    label = re.sub(r"\s+", "", left).casefold()
     value = right.strip().casefold()
     if not label:
         return False
@@ -255,7 +285,7 @@ def is_empty_field(line, next_nonempty=""):
         return True
     # Leave headings without values (including DIMENSION:) alone, except
     # specifically defined metadata placeholders.
-    if not value and label in EMPTY_MPN_LABELS:
+    if not value and label in {re.sub(r"\s+", "", x) for x in EMPTY_MPN_LABELS}:
         return True
     return False
 
@@ -365,7 +395,7 @@ def format_rfq_python(text):
             continue
         if is_empty_field(line, next_nonempty):
             continue
-        sections[active].append(line)
+        sections[active].append(normalize_mpn_label(line) if active == "MPN Text" else line)
 
     # In SAP extracts PO Material Text often acts as a carrier of Basic Data.
     # Keep a separate PO section only for genuine purchase-order prose preceding
