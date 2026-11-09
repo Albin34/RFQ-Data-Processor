@@ -208,9 +208,10 @@ SECTION_PATTERNS = {
     "MPN Text": re.compile(r"^mpn\s+text\s*:?\s*$", re.I),
     "Inspection Text": re.compile(r"^inspection\s+text\s*:?\s*$", re.I),
     "Purchase Order Text": re.compile(r"^purchase\s+order\s+text\s*:?\s*$", re.I),
-    "PO Material Text": re.compile(r"^(?:po\s+material|material\s+po)\s+text\s*:?\s*$", re.I),
+    "PO Material Text": re.compile(r"^po\s+material\s+text\s*:?\s*$", re.I),
+    "Material PO Text": re.compile(r"^material\s+po\s+text\s*:?\s*$", re.I),
 }
-SECTION_ORDER = ("Purchase Order Text", "PO Material Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
+SECTION_ORDER = ("Purchase Order Text", "PO Material Text", "Material PO Text", "Basic Data Text", "Classification Text", "MPN Text", "Inspection Text")
 EMPTY_MARKERS = {"", "-", "--", "---", "n/a", "na", "nil", "none", "null"}
 META_LINES = set()
 FOLLOWED_BY_DATA_LABELS = {"tag nos", "tag numbers", "mpn details"}
@@ -346,16 +347,14 @@ def expand_inline_rfq_fields(raw):
     """
     expanded = []
     for physical_line in str(raw).splitlines():
+        # Work from the original positions, not from a string being modified
+        # in-place. Offsets otherwise shift after the first inserted newline
+        # and may leave a dangling colon in concatenated section headings.
+        sections_split = _INLINE_SECTION_RE.sub(
+            lambda match: ("\n" if match.start() else "") + match.group(0) + "\n",
+            physical_line,
+        )
         matches = list(_INLINE_SECTION_RE.finditer(physical_line))
-        sections_split = physical_line
-        for match in reversed(matches):
-            # A heading appearing after narrative text is a new section.
-            if match.start() > 0 and sections_split[:match.start()].strip():
-                sections_split = sections_split[:match.start()].rstrip() + "\n" + sections_split[match.start():]
-            # Split heading from any field text immediately following it.
-            end = match.end()
-            if end < len(sections_split) and sections_split[end:].strip():
-                sections_split = sections_split[:end] + "\n" + sections_split[end:].lstrip()
         for subline in sections_split.splitlines():
             fields = list(_INLINE_LABEL_RE.finditer(subline))
             if len(fields) < 2 and not (fields and fields[0].start() > 0 and matches):
@@ -377,12 +376,15 @@ def format_rfq_python(text):
     raw = _clean(text).replace("\r\n", "\n").replace("\r", "\n")
     # Corrupted Ariba carrier heading (not a technical specification).
     # Only remove the malformed heading itself; retain the following data.
-    raw = re.sub(r"(?im)^\s*;\s*Material\s+PO\s+text\s*:\s*(?=\n|$)", "", raw)
+    raw = re.sub(r"(?im)^\s*;\s*Material\s+PO\s+text\s*:", "", raw)
     raw = expand_inline_rfq_fields(raw)
     if not raw:
         return "", ""
     # Map supplied lines to known sections without losing free-form descriptions.
     sections = {name: [] for name in SECTION_ORDER}
+    # Remember the exact heading supplied, even if the next section starts
+    # immediately (the inline splitter may produce an otherwise empty block).
+    material_po_seen = False
     active = "Basic Data Text"
     original_lines = [line.strip() for line in raw.split("\n")]
     for idx, line in enumerate(original_lines):
@@ -392,6 +394,8 @@ def format_rfq_python(text):
         header = match_section(line)
         if header:
             active = header
+            if header == "Material PO Text":
+                material_po_seen = True
             continue
         if is_empty_field(line, next_nonempty):
             continue
@@ -458,8 +462,8 @@ def format_rfq_python(text):
     chunks = []
     for section in SECTION_ORDER:
         lines = sections[section]
-        if lines:
-            chunks.append(section + ":\n" + "\n".join(lines))
+        if lines or (section == "Material PO Text" and material_po_seen):
+            chunks.append(section + ":\n" + "\n".join(lines) if lines else section + ":")
     # Always preserve relevant data, even when no headers were present.
     output = "\n\n".join(chunks)
     return remove_separator_lines(normalize_pdf_symbols(output)), extract_manufacturers(raw)
