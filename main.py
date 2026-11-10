@@ -1016,8 +1016,14 @@ def parse_tabular_rfq_pdf(pdf_file):
                 description_lines = physical_lines(column_words(row_words, 190, 400, top_y - 2, lower_y))
                 if not description_lines:
                     continue
-                if not (re.fullmatch(r"\d{4,6}", pr_item) and re.fullmatch(r"\d{6,}", material)
-                        and re.fullmatch(r"[\d,.]+", qty) and re.fullmatch(r"[A-Za-z]{1,8}", uom)):
+                # Some Fertil service RFQs have an intentionally blank
+                # Material / Service # column. The PR item, row sequence,
+                # quantity and UOM still identify the row unambiguously.
+                # Do not require a material number where none is supplied.
+                if not (re.fullmatch(r"\d{4,6}", pr_item)
+                        and (not material or re.fullmatch(r"\d{6,}", material))
+                        and re.fullmatch(r"[\d,.]+", qty)
+                        and re.fullmatch(r"[A-Za-z]{1,8}", uom)):
                     continue
                 all_items.append({"RFx Number": rfq_number, "RFx Item No": str(int(pr_item)),
                                   "PR Item No": pr_item, "Material No": material,
