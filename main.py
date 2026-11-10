@@ -992,19 +992,33 @@ def parse_tabular_rfq_pdf(pdf_file):
                 text_top = header_y + 8
                 layout_seen = True
             elif layout_seen:
-                text_top = 88
+                # Continuation-only pages may have the preceding item's
+                # technical lines immediately below the RFQ header (y~70),
+                # ABOVE the first numbered item (and above y=88). Never
+                # discard that top-of-table fragment.
+                text_top = 58
             else:
                 continue
             bottom = page.rect.height - 30
+            # Audit the complete Description column independently of the
+            # numbered-row assignment. Fail closed if any source word is lost.
+            page_description_words = column_words(words, 190, 400, text_top, bottom)
+            assigned_description_words = []
             row_heads = sorted([(w[1], int(str(w[4]))) for w in words
                                 if text_top <= w[1] < bottom and 0 <= w[0] < 35
                                 and re.fullmatch(r"\d{1,3}", str(w[4]))], key=lambda x: x[0])
             # A partial row may occupy the top of a new page BEFORE a new item.
             first_y = row_heads[0][0] if row_heads else bottom
-            continuation = physical_lines(column_words(words, 190, 400, text_top, first_y - 1))
-            if continuation and all_items:
+            continuation_words = column_words(words, 190, 400, text_top, first_y - 1)
+            continuation = physical_lines(continuation_words)
+            if continuation:
+                if not all_items:
+                    raise ValueError(
+                        "PDF continuation text found before any RFQ item; cannot assign it safely"
+                    )
                 previous = all_items[-1]
                 previous["PO Text"] = (previous["PO Text"].rstrip() + "\n" + "\n".join(continuation)).strip()
+                assigned_description_words.extend(continuation_words)
 
             for idx, (top_y, sequence) in enumerate(row_heads):
                 lower_y = row_heads[idx + 1][0] - 1 if idx + 1 < len(row_heads) else bottom
@@ -1013,7 +1027,8 @@ def parse_tabular_rfq_pdf(pdf_file):
                 material = " ".join(w[4] for w in column_words(row_words, 119, 190, top_y - 2, lower_y)).strip()
                 qty = " ".join(w[4] for w in column_words(row_words, 400, 445, top_y - 2, lower_y)).strip()
                 uom = " ".join(w[4] for w in column_words(row_words, 445, 490, top_y - 2, lower_y)).strip()
-                description_lines = physical_lines(column_words(row_words, 190, 400, top_y - 2, lower_y))
+                description_words = column_words(row_words, 190, 400, top_y - 2, lower_y)
+                description_lines = physical_lines(description_words)
                 if not description_lines:
                     continue
                 # Some Fertil service RFQs have an intentionally blank
@@ -1030,6 +1045,25 @@ def parse_tabular_rfq_pdf(pdf_file):
                                   "Description": description_lines[0],
                                   "PO Text": "\n".join(description_lines[1:]),
                                   "QTY": qty, "UOM": uom})
+                assigned_description_words.extend(description_words)
+
+            # This checks *extraction* against PDF source coordinates, before
+            # formatter/preview validation. A missing page fragment is NOT
+            # allowed to silently pass with zero technical warnings.
+            def word_identity(w):
+                return (round(w[0], 2), round(w[1], 2), str(w[4]))
+
+            missing = Counter(map(word_identity, page_description_words)) - Counter(
+                map(word_identity, assigned_description_words)
+            )
+            if missing:
+                examples = [value[2] for value in list(missing.elements())[:12]]
+                raise ValueError(
+                    f"Incomplete RFQ table extraction on PDF page {page.number + 1}: "
+                    f"{sum(missing.values())} description-column words were not "
+                    f"assigned to an RFQ item ({' '.join(examples)}). "
+                    "No output was generated; review the PDF layout."
+                )
     finally:
         doc.close()
     return all_items if all_items else None
@@ -1272,13 +1306,16 @@ def format_dubai_petroleum_note(source):
 VALIDATION_LABELS = re.compile(
     r"^(?:MFR|MFG|MANUFACTURER(?: NAME| NUMBER| PART NUMBER)?|PART(?: NUMBER| NO)?|"
     r"MPN|OEM(?: PART| MODEL| SERIAL)?(?: NUMBER)?|MODEL(?: NUMBER)?|"
-    r"DRAWING(?: NUMBER| NO)?|TAG(?: NUMBER| NO| NOS)?|"
+    r"DRAWING(?: NUMBER| NO)?|ITEM\s*-\s*DRAWING NUMBER|"
+    r"ITEM\s*-\s*MANUFACTURER PART NUMBER|"
+    r"POSITION NUMBER|CATALOG CODE|IDENT NO\.?|ADDITIONAL INFORMATION|"
+    r"TAG(?: NUMBER| NO| NOS)?|"
     r"MATERIAL|GRADE|STANDARD|SIZE(?: [A-Z])?|THICKNESS|DIAMETER|LENGTH|"
     r"PRESSURE(?: RATING| RANGE)?|RANGE|TEMPERATURE(?: RATING)?|VOLTAGE|"
     r"POWER(?: SUPPLY| RATING)?|CONNECTION|CLASS(?: RATING)?|"
     r"FLOW(?: RATING)?|CAPACITY|ACCURACY|RATED VOLTAGE)\s*:\s*(.+)$", re.I)
 VALIDATION_EMPTY = {"", "-", "--", "---", "N/A", "NONE", "NULL"}
-CRITICAL_FIELD = re.compile(r"MFR|MANUFACTURER|PART|MPN|OEM|MODEL|DRAWING|TAG", re.I)
+CRITICAL_FIELD = re.compile(r"MFR|MANUFACTURER|PART|MPN|OEM|MODEL|DRAWING|TAG|POSITION|CATALOG", re.I)
 NUMBER_TOKEN = re.compile(r"(?<![A-Za-z])(?:\d+(?:[.,]\d+)*(?:/\d+)?)(?:\s*(?:MM|CM|IN|INCH|BAR|PSI|VAC|VDC|V|HZ|RPM|DEG|°C|°F|KG|LPM))?", re.I)
 
 def compare_normalize(value):
