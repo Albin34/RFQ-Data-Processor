@@ -943,6 +943,53 @@ def format_nawah_pdf_note(note):
     return remove_separator_lines(raw), extract_manufacturers(raw)
 
 
+def detect_fertil_continuation_top(page, description_left=190, description_right=400):
+    """Find the actual top of a continuation table from its drawn cells.
+
+    Continuation-only pages may have no column labels. Use the page's
+    description-cell rectangles rather than a fixed Y coordinate. Return None
+    if the table cannot be located confidently; never guess a clipping limit.
+    """
+    candidates = []
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if item[0] != "re":
+                continue
+            r = item[1]
+            # The description cell spans approximately x=189..402 on
+            # Fertil's tabular layout. Repeated row cells share this span.
+            # Avoid the outer page/table box and other narrow columns.
+            if (abs(r.x0 - (description_left - 1)) <= 12
+                    and abs(r.x1 - (description_right + 2)) <= 12
+                    and r.width >= 150 and r.height >= 14
+                    and r.y0 >= 30 and r.y0 < page.rect.height - 45):
+                candidates.append(r.y0)
+    if not candidates:
+        return None
+    # PDF glyphs occasionally begin 1-2 points ABOVE their enclosing cell.
+    # Keep a small tolerance; verify the area above separately rather than
+    # extending blindly upward into page headers.
+    return max(30.0, min(candidates) - 5.0)
+
+
+def audit_fertil_continuation_margin(words, top, page_number, x_left=190, x_right=400):
+    """Fail closed if text sits above the detected continuation table.
+
+    Content between the page's RFQ number/header and the detected cell top
+    cannot safely be assigned using geometry alone. Flag it for review instead
+    of silently clipping it or attributing it to the wrong RFQ item.
+    """
+    unexpected = [w for w in words
+                  if x_left <= w[0] < x_right and 38 <= w[1] < top]
+    if unexpected:
+        sample = " ".join(str(w[4]) for w in sorted(unexpected, key=lambda w:(w[1],w[0]))[:14])
+        raise ValueError(
+            f"Possible unassigned PDF continuation above detected table on "
+            f"page {page_number}: {sample}. Extraction stopped to prevent "
+            "silent omission; review the PDF page boundary."
+        )
+
+
 def parse_tabular_rfq_pdf(pdf_file):
     """Extract Fertil RFQ table rows, including continuation text across pages.
 
@@ -986,17 +1033,23 @@ def parse_tabular_rfq_pdf(pdf_file):
             headers = [w for w in words if str(w[4]).lower() == "description"
                        and 190 < w[0] < 400 and w[1] < 380]
             header_y = min((w[1] for w in headers), default=None)
-            # Fertil's first page has a cover block and table starting ~350;
-            # continuation pages have table at y~86, sometimes no header.
+            # A repeated table header gives a reliable starting boundary.
+            # Headerless continuation pages instead use the actual drawn
+            # description-cell top, which can be higher than any sample Y.
             if header_y is not None:
                 text_top = header_y + 8
                 layout_seen = True
             elif layout_seen:
-                # Continuation-only pages may have the preceding item's
-                # technical lines immediately below the RFQ header (y~70),
-                # ABOVE the first numbered item (and above y=88). Never
-                # discard that top-of-table fragment.
-                text_top = 58
+                text_top = detect_fertil_continuation_top(page)
+                if text_top is None:
+                    raise ValueError(
+                        f"Fertil continuation table boundary not detected "
+                        f"on PDF page {page.number + 1}. Cannot safely "
+                        "assign description text across the page break."
+                    )
+                audit_fertil_continuation_margin(
+                    words, text_top, page.number + 1
+                )
             else:
                 continue
             bottom = page.rect.height - 30
