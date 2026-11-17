@@ -1570,7 +1570,7 @@ def _review_enter_edit(prefix):
     current = st.session_state.get(f"formatted_{prefix}_{pos}") or item["formatted"]
     if not str(current).strip():
         current = item.get("initial_formatted", "")
-    st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(current)
+    st.session_state[f"editable_{prefix}_{pos}"] = (repair_split_bold_markers(current) if item.get("manual_bold_edit") else editor_bold_markers(current))
     st.session_state[f"editablemaker_{prefix}_{pos}"] = st.session_state.get(
         f"maker_{prefix}_{pos}", item["manufacturer"])
     item["editing"] = True
@@ -1586,6 +1586,10 @@ def _save_current(review, prefix):
             st.error("The formatted editor is empty. Restore or enter text before leaving this item.")
             return False
         item["formatted"] = repair_split_bold_markers(value)
+        # Once edited, the user-visible **markers** become the sole authority
+        # for bold text in this item. Never automatically re-bold a line
+        # whose markers the user deliberately removed.
+        item["manual_bold_edit"] = True
         item["manufacturer"] = st.session_state.get(f"editablemaker_{prefix}_{pos}", item["manufacturer"])
     else:
         value = st.session_state.get(f"formatted_{prefix}_{pos}", item["formatted"])
@@ -1698,20 +1702,20 @@ def plain_review_text(text):
     return repair_split_bold_markers(text).replace("**", "")
 
 
-def working_sheet_rich_text(text):
-    """Turn manual emphasis and manufacturer/part-number lines into Excel runs."""
+def working_sheet_rich_text(text, *, auto_bold=True):
+    """Convert manual **markers** to Excel bold. Auto-bold only untouched drafts."""
     source = repair_split_bold_markers(text)
     segments = []
     for line in source.splitlines(keepends=True):
-        auto_bold = bool(BOLD_TECHNICAL_LINE.match(line))
+        line_auto_bold = auto_bold and bool(BOLD_TECHNICAL_LINE.match(line))
         cursor = 0
         for match in BOLD_MARKERS.finditer(line):
             if match.start() > cursor:
-                segments.append((line[cursor:match.start()], auto_bold))
+                segments.append((line[cursor:match.start()], line_auto_bold))
             segments.append((match.group(1), True))
             cursor = match.end()
         if cursor < len(line):
-            segments.append((line[cursor:], auto_bold))
+            segments.append((line[cursor:], line_auto_bold))
     if not segments:
         return source
     # Preserve the template's base font; only set bold on the rich-text runs.
@@ -1754,7 +1758,7 @@ def make_rich_text_shared_strings(data, items=None):
     indices = {}
     for idx, item in enumerate(items):
         plain = plain_review_text(item["formatted"])
-        runs = working_sheet_runs(item["formatted"])
+        runs = working_sheet_runs(item["formatted"], auto_bold=not item.get("manual_bold_edit", False))
         # XlsxWriter requires at least two fragments for write_rich_string.
         if len(runs) >= 2:
             parts = []
@@ -1819,9 +1823,9 @@ def make_rich_text_shared_strings(data, items=None):
     return out.getvalue()
 
 
-def working_sheet_runs(value):
-    """Merge adjacent rich text runs so an entire MPN line stays bold."""
-    rich = working_sheet_rich_text(value)
+def working_sheet_runs(value, *, auto_bold=True):
+    """Merge adjacent rich text runs, honoring manual Ctrl+B removal."""
+    rich = working_sheet_rich_text(value, auto_bold=auto_bold)
     if not isinstance(rich, CellRichText):
         return [(str(rich), False)] if rich else []
     pieces = []
@@ -1970,7 +1974,8 @@ def confirm_verify_all_popup(session_prefix):
             if item.get("tabular_pdf"):
                 item["desc"] = st.session_state.get(f"desc_{session_prefix}_{pos}", item["desc"]).strip()
             if item["editing"]:
-                item["formatted"] = st.session_state.get(f"editable_{session_prefix}_{pos}", item["formatted"])
+                item["formatted"] = repair_split_bold_markers(st.session_state.get(f"editable_{session_prefix}_{pos}", item["formatted"]))
+                item["manual_bold_edit"] = True
                 item["manufacturer"] = st.session_state.get(f"editablemaker_{session_prefix}_{pos}", item["manufacturer"])
             for record in queue:
                 record["verified"] = True
@@ -1992,11 +1997,13 @@ def _review_undo(prefix):
     item = review["queue"][pos]
     if not item["history"]:
         return
-    text, maker, desc = item["history"].pop()
-    item.update(formatted=text, manufacturer=maker, desc=desc, verified=False)
+    saved = item["history"].pop()
+    text, maker, desc = saved[:3]
+    manual_bold = saved[3] if len(saved) > 3 else False
+    item.update(formatted=text, manufacturer=maker, desc=desc, verified=False, manual_bold_edit=manual_bold)
     st.session_state[f"formatted_{prefix}_{pos}"] = text
     st.session_state[f"maker_{prefix}_{pos}"] = maker
-    st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(text)
+    st.session_state[f"editable_{prefix}_{pos}"] = (repair_split_bold_markers(text) if manual_bold else editor_bold_markers(text))
     st.session_state[f"editablemaker_{prefix}_{pos}"] = maker
     if item.get("tabular_pdf"):
         st.session_state[f"desc_{prefix}_{pos}"] = desc
@@ -2007,9 +2014,9 @@ def _review_reset(prefix):
     pos = review["position"]
     item = review["queue"][pos]
     current = (st.session_state.get(f"editable_{prefix}_{pos}",item["formatted"]) if item["editing"] else item["formatted"])
-    item["history"].append((current, item["manufacturer"],item["desc"]))
+    item["history"].append((current, item["manufacturer"], item["desc"], item.get("manual_bold_edit", False)))
     item.update(formatted=item["initial_formatted"],manufacturer=item["initial_manufacturer"],
-                desc=item["initial_desc"],verified=False)
+                desc=item["initial_desc"],verified=False,manual_bold_edit=False)
     st.session_state[f"formatted_{prefix}_{pos}"] = item["formatted"]
     st.session_state[f"maker_{prefix}_{pos}"] = item["manufacturer"]
     st.session_state[f"editable_{prefix}_{pos}"] = editor_bold_markers(item["formatted"])
@@ -2094,7 +2101,7 @@ def review_popup(session_prefix):
         if edit_text_key not in st.session_state or (
             not str(st.session_state[edit_text_key]).strip() and str(item["formatted"]).strip()
         ):
-            st.session_state[edit_text_key] = editor_bold_markers(item["formatted"])
+            st.session_state[edit_text_key] = (repair_split_bold_markers(item["formatted"]) if item.get("manual_bold_edit") else editor_bold_markers(item["formatted"]))
         st.session_state[edit_text_key] = repair_split_bold_markers(st.session_state[edit_text_key])
         st.session_state.setdefault(edit_maker_key, item["manufacturer"])
         left_panel, right_panel = st.columns([1, 1], gap="medium")
@@ -2171,8 +2178,11 @@ def review_popup(session_prefix):
                 new_mfr = (st.session_state.get(edit_maker_key,item["manufacturer"]) if item["editing"]
                            else st.session_state[maker_key]).strip()
                 if (updated,new_mfr,new_desc)!=(item["formatted"],item["manufacturer"],item["desc"]):
-                    item["history"].append((item["formatted"],item["manufacturer"],item["desc"]))
-                item.update(formatted=updated,manufacturer=new_mfr,desc=new_desc,verified=True,editing=False)
+                    item["history"].append((item["formatted"], item["manufacturer"], item["desc"], item.get("manual_bold_edit", False)))
+                was_editing = item["editing"]
+                item.update(formatted=repair_split_bold_markers(updated),manufacturer=new_mfr,desc=new_desc,verified=True,editing=False)
+                if was_editing:
+                    item["manual_bold_edit"] = True
                 st.session_state[text_key]=updated
                 st.session_state[maker_key]=new_mfr
                 if all(q["verified"] for q in queue):
