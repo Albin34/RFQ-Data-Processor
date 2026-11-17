@@ -2216,24 +2216,49 @@ def review_popup(session_prefix):
           if (start === end) return;
           ev.preventDefault();
           ev.stopPropagation();
-          let before = textarea.value.slice(0, start);
-          let selected = textarea.value.slice(start, end);
-          let after = textarea.value.slice(end);
-          // Keep trailing whitespace/newlines outside the bold span.
-          const tail = (selected.match(/[\s]+$/) || [''])[0];
-          if (tail) { selected = selected.slice(0, -tail.length); after = tail + after; }
-          const lead = (selected.match(/^[ \t]+/) || [''])[0];
-          if (lead) { before += lead; selected = selected.slice(lead.length); }
-          if (!selected) return;
-          let replacement;
-          if (selected.startsWith('**') && selected.endsWith('**') && selected.length >= 4) {
-            replacement = selected.slice(2, -2);
-          } else if (before.endsWith('**') && after.startsWith('**')) {
-            before = before.slice(0, -2);
-            after = after.slice(2);
-            replacement = selected;
+          let before, replacement, after;
+          const raw = textarea.value;
+          if (raw.slice(start, end).includes('\n')) {
+            // Ctrl+B affects individual physical lines, not one multi-line span.
+            // Include complete first/last selected lines so existing **markers**
+            // are recognized even when only their inner text was selected.
+            const lineStart = raw.lastIndexOf('\n', start - 1) + 1;
+            const nextBreak = raw.indexOf('\n', end - 1);
+            const lineEnd = nextBreak < 0 ? raw.length : nextBreak;
+            before = raw.slice(0, lineStart);
+            after = raw.slice(lineEnd);
+            const lines = raw.slice(lineStart, lineEnd).split('\n');
+            const nonEmpty = lines.filter(line => line.trim().length > 0);
+            const isMarked = line => /^([ \t]*)\*\*(.*?)\*\*([ \t]*)$/.test(line);
+            const removeBold = nonEmpty.length > 0 && nonEmpty.every(isMarked);
+            replacement = lines.map(line => {
+              if (!line.trim()) return line;
+              if (removeBold) {
+                return line.replace(/^([ \t]*)\*\*(.*?)\*\*([ \t]*)$/, '$1$2$3');
+              }
+              if (isMarked(line)) return line;
+              const m = line.match(/^([ \t]*)(.*?)([ \t]*)$/);
+              return m[1] + '**' + m[2] + '**' + m[3];
+            }).join('\n');
           } else {
-            replacement = '**' + selected + '**';
+            before = raw.slice(0, start);
+            let selected = raw.slice(start, end);
+            after = raw.slice(end);
+            // Keep trailing whitespace/newlines outside the bold span.
+            const tail = (selected.match(/[\s]+$/) || [''])[0];
+            if (tail) { selected = selected.slice(0, -tail.length); after = tail + after; }
+            const lead = (selected.match(/^[ \t]+/) || [''])[0];
+            if (lead) { before += lead; selected = selected.slice(lead.length); }
+            if (!selected) return;
+            if (selected.startsWith('**') && selected.endsWith('**') && selected.length >= 4) {
+              replacement = selected.slice(2, -2);
+            } else if (before.endsWith('**') && after.startsWith('**')) {
+              before = before.slice(0, -2);
+              after = after.slice(2);
+              replacement = selected;
+            } else {
+              replacement = '**' + selected + '**';
+            }
           }
           const value = before + replacement + after;
           // React/Streamlit expects the native setter + a bubbling input event.
