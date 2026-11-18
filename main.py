@@ -629,7 +629,10 @@ def _summarize_nawah_quality(quality):
         # because another known requirement was detected elsewhere.
         if code is None:
             payload = re.sub(r"^\s*QUALITY REQUIREMENTS?\s*:?\s*", "", payload, flags=re.I)
-            if not payload.strip():
+            # PDF/XLS exports sometimes leave decorative separators or a
+            # solitary terminal period outside a completed message block.
+            # Ignore only punctuation-only fragments, never requirement text.
+            if not payload.strip() or re.fullmatch(r"[\s*=_#~.\-]+", payload):
                 continue
             # Standalone known certificates can be shortened, but anything
             # with additional instructions remains intact.
@@ -664,6 +667,38 @@ def _summarize_nawah_quality(quality):
                 # An individual PDF extraction may leave a terminal full stop
                 # outside the message block. It is not a requirement.
                 unknown.append(calibration)
+            continue
+        if short_code == "SHELF LIFE":
+            # Explicit Nawah rule: keep only the shelf-life requirement itself.
+            # Do not retain procurement approval, shipment or packaging prose.
+            # If a future revision is not recognizable, retain the full block
+            # rather than silently losing technical information.
+            substantive = []
+            for source_line in block.splitlines():
+                if (_NAWAH_START.match(source_line) or _NAWAH_END.match(source_line)
+                        or re.fullmatch(r"\s*[*=_-]{4,}\s*", source_line)):
+                    continue
+                substantive.append(source_line.strip())
+            unwrapped = " ".join(" ".join(substantive).split())
+            heading = re.search(
+                r"SHELF\s+LIFE\s+REMAINING\s*/\s*CURE\s+DATE\s+REQUIREMENTS",
+                unwrapped, re.I,
+            )
+            minimum = re.search(
+                r"ITEMS\s+SHOULD\s+HAVE\s+A\s+MINIMUM\s+OF\s+70\s*%\s+"
+                r"OF\s+THEIR\s+RECOMMENDED\s+SHELF\s+LIFE\s+REMAINING\s+AT\s+"
+                r"TIME\s+OF\s+RECEIPT\s+AT\s+BARAKAH\s+NUCLEAR\s+POWER\s+PLANT\.?",
+                unwrapped, re.I,
+            )
+            if heading and minimum:
+                clauses.append(
+                    "SHELF LIFE REMAINING / CURE DATE REQUIREMENTS\n"
+                    "ITEMS SHOULD HAVE A MINIMUM OF 70% OF THEIR RECOMMENDED SHELF LIFE\n"
+                    "REMAINING AT TIME OF RECEIPT AT BARAKAH NUCLEAR POWER PLANT."
+                )
+            else:
+                # Do not truncate unfamiliar shelf-life conditions.
+                unknown.append(payload)
             continue
         if short_code == "QA SR MATERIAL":
             clauses.append("NUCLEAR SAFETY-RELATED MATERIAL: NAWAH-approved nuclear QA requirements apply; review full source requirements.")
