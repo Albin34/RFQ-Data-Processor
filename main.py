@@ -590,6 +590,20 @@ _NAWAH_START = re.compile(r"^\s*START OF MESSAGE CODE\s+(Z_NPE_[^\n]+?)\s*$", re
 _NAWAH_END = re.compile(r"^\s*END OF MESSAGE CODE\s+(Z_NPE_[^\n]+?)\s*$", re.I)
 
 
+def _nawah_strip_message_wrappers(text):
+    """Hide message-code metadata even for unknown blocks; retain actual requirements."""
+    kept = []
+    for line in str(text).splitlines():
+        if _NAWAH_START.fullmatch(line) or _NAWAH_END.fullmatch(line):
+            continue
+        if re.fullmatch(r"\s*[*=_#~-]{4,}\s*", line):
+            continue
+        if re.fullmatch(r"\s*[.\-]+\s*", line):
+            continue
+        kept.append(line.rstrip())
+    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", "\n".join(kept).strip())
+
+
 def _summarize_nawah_quality(quality):
     """Handle known message codes; preserve every unknown block unabridged."""
     lines = quality.splitlines()
@@ -692,7 +706,7 @@ def _summarize_nawah_quality(quality):
             )
             if heading and minimum:
                 clauses.append(
-                    "SHELF LIFE REMAINING / CURE DATE REQUIREMENTS\n"
+                    "SHELF LIFE REMAINING / CURE DATE REQUIREMENTS\n\n"
                     "ITEMS SHOULD HAVE A MINIMUM OF 70% OF THEIR RECOMMENDED SHELF LIFE\n"
                     "REMAINING AT TIME OF RECEIPT AT BARAKAH NUCLEAR POWER PLANT."
                 )
@@ -718,8 +732,10 @@ def _summarize_nawah_quality(quality):
         # inspection. Retain its actual original wording for human verification.
         unknown.append(payload)
     unique_clauses = list(dict.fromkeys(clauses))
-    parts = unique_clauses + unknown
-    return "\n\n".join(parts)
+    # Important: keep unknown requirements, but NEVER carry source message-code
+    # wrappers (including empty, previously unseen message codes) to the sheet.
+    parts = [_nawah_strip_message_wrappers(part) for part in unique_clauses + unknown]
+    return "\n\n".join(part for part in parts if part)
 
 
 def summarize_nawah_working_note(raw):
